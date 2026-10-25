@@ -172,6 +172,7 @@ struct App {
     message: Option<String>,
     focus_editor: bool,
     filter_history: Vec<String>,
+    window: WindowState,
     last_poll: Instant,
     status: (usize, usize, usize),
 }
@@ -298,6 +299,11 @@ impl App {
             message: None,
             focus_editor: true,
             filter_history: Vec::new(),
+            window: load_window().unwrap_or(WindowState {
+                pos: None,
+                size: egui::vec2(1000.0, 700.0),
+                maximized: false,
+            }),
             last_poll: Instant::now(),
             status: (1, 1, 1),
         };
@@ -907,6 +913,9 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        save_window(&self.window);
+    }
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::N)) {
             self.browser = None;
@@ -929,6 +938,21 @@ impl eframe::App for App {
             self.toggle_filter();
         }
         let zoom = ctx.input(|i| i.zoom_delta());
+        ctx.input(|i| {
+            let vp = i.viewport();
+            let maximized = vp.maximized.unwrap_or(false);
+            if vp.minimized.unwrap_or(false) {
+                return;
+            }
+            self.window.maximized = maximized;
+            // Keep the last restored geometry so it survives exiting while maximized.
+            if !maximized {
+                if let (Some(inner), Some(outer)) = (vp.inner_rect, vp.outer_rect) {
+                    self.window.size = inner.size();
+                    self.window.pos = Some(outer.min);
+                }
+            }
+        });
         if zoom != 1.0 {
             self.font_size = (self.font_size * zoom).clamp(6.0, 96.0);
         }
@@ -979,10 +1003,51 @@ impl eframe::App for App {
     }
 }
 
+struct WindowState {
+    pos: Option<egui::Pos2>,
+    size: egui::Vec2,
+    maximized: bool,
+}
+
+fn window_file() -> Option<PathBuf> {
+    recent_file().map(|f| f.with_file_name("window.txt"))
+}
+
+fn load_window() -> Option<WindowState> {
+    let s = std::fs::read_to_string(window_file()?).ok()?;
+    let v: Vec<f32> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+    if v.len() != 5 || v[2] < 200.0 || v[3] < 150.0 || v.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    // Reject positions that are clearly off any screen (e.g. minimized sentinel values).
+    let pos = (v[0] > -10000.0 && v[1] > -10000.0 && v[0] < 20000.0 && v[1] < 20000.0)
+        .then(|| egui::pos2(v[0], v[1]));
+    Some(WindowState { pos, size: egui::vec2(v[2], v[3]), maximized: v[4] != 0.0 })
+}
+
+fn save_window(w: &WindowState) {
+    let Some(f) = window_file() else { return };
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let p = w.pos.unwrap_or(egui::pos2(-99999.0, -99999.0));
+    let _ = std::fs::write(
+        f,
+        format!("{} {} {} {} {}", p.x, p.y, w.size.x, w.size.y, w.maximized as u8),
+    );
+}
+
 fn main() -> eframe::Result {
     let file = std::env::args_os().nth(1).map(PathBuf::from);
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("rusted");
+    if let Some(w) = load_window() {
+        viewport = viewport.with_inner_size(w.size).with_maximized(w.maximized);
+        if let Some(p) = w.pos {
+            viewport = viewport.with_position(p);
+        }
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("rusted"),
+        viewport,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
