@@ -66,6 +66,10 @@ struct Tab {
     filter: FilterState,
     highlight: Option<usize>,
     scroll_to_highlight: bool,
+    word_wrap: bool,
+    hidden_chars: bool,
+    tail: bool,
+    scroll_to_end: bool,
 }
 
 impl Tab {
@@ -158,8 +162,6 @@ struct App {
     active: usize,
     next_id: u64,
     recent: Vec<PathBuf>,
-    word_wrap: bool,
-    hidden_chars: bool,
     font_size: f32,
     browser: Option<Browser>,
     message: Option<String>,
@@ -221,10 +223,22 @@ fn read_tail(tab: &mut Tab, path: &Path) -> bool {
     if f.take(len - tab.disk_len).read_to_end(&mut buf).is_err() {
         return false;
     }
-    // Only consume whole lines so partial writes and split UTF-8 sequences wait for the next poll.
-    let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return false };
-    buf.truncate(end + 1);
-    let s = String::from_utf8_lossy(&buf);
+    // Consume as much as can be decoded so far; a trailing partial line is shown and completed
+    // by later reads. A trailing '\r' is held back so CRLF pairs are never split.
+    if tab.crlf && buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let s: String = match std::str::from_utf8(&buf) {
+        Ok(s) => s.to_owned(),
+        Err(e) if e.error_len().is_none() => {
+            buf.truncate(e.valid_up_to());
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        Err(_) => String::from_utf8_lossy(&buf).into_owned(),
+    };
+    if buf.is_empty() {
+        return false;
+    }
     if tab.crlf {
         tab.text.push_str(&s.replace("\r\n", "\n"));
     } else {
@@ -242,8 +256,6 @@ impl App {
             active: 0,
             next_id: 0,
             recent: load_recent(),
-            word_wrap: false,
-            hidden_chars: false,
             font_size: DEFAULT_FONT_SIZE,
             browser: None,
             message: None,
@@ -278,6 +290,10 @@ impl App {
             filter: FilterState::default(),
             highlight: None,
             scroll_to_highlight: false,
+            word_wrap: false,
+            hidden_chars: false,
+            tail: false,
+            scroll_to_end: false,
         });
         self.next_id += 1;
         self.active = self.tabs.len() - 1;
@@ -403,25 +419,33 @@ impl App {
 
     // Keeps the active tab's filter results current; with `poll_disk` it also tails the file.
     fn update_filter(&mut self, poll_disk: bool) {
-        let tail = self.tail;
+        let filter_tail = self.filter_open && self.tail;
+        let filter_open = self.filter_open;
         let applied = self.applied.clone();
         let tab = &mut self.tabs[self.active];
+
+        let mut disk_changed = false;
+        if poll_disk && !tab.dirty && (tab.tail || filter_tail) {
+            if let Some(path) = tab.path.clone() {
+                disk_changed = read_tail(tab, &path);
+            }
+        }
+        if disk_changed && tab.tail {
+            tab.scroll_to_end = true;
+        }
+        if !filter_open {
+            return;
+        }
+
         let mut full = tab.filter.applied.as_ref() != Some(&applied);
-        if tail && tab.filter.needs_rescan {
+        if filter_tail && tab.filter.needs_rescan {
             full = true;
         }
         tab.filter.needs_rescan = false;
-
-        let mut changed = full;
-        if poll_disk && tail && !tab.dirty {
-            if let Some(path) = tab.path.clone() {
-                changed |= read_tail(tab, &path);
-            }
-        }
         if full {
             tab.filter = FilterState { applied: Some(applied.clone()), ..Default::default() };
             tab.filter.scan(&tab.text, &applied.0, applied.1);
-        } else if changed {
+        } else if disk_changed && filter_tail {
             tab.filter.scan(&tab.text, &applied.0, applied.1);
         }
     }
@@ -532,8 +556,12 @@ impl App {
                 }
             });
             ui.menu_button("View", |ui| {
-                ui.checkbox(&mut self.word_wrap, "Word wrap");
-                ui.checkbox(&mut self.hidden_chars, "Hidden characters");
+                let tab = &mut self.tabs[self.active];
+                ui.checkbox(&mut tab.word_wrap, "Word wrap");
+                ui.checkbox(&mut tab.hidden_chars, "Hidden characters");
+                if ui.checkbox(&mut tab.tail, "Tail").changed() && tab.tail {
+                    tab.scroll_to_end = true;
+                }
             });
         });
     }
@@ -646,9 +674,10 @@ impl App {
 
     fn editor_ui(&mut self, ui: &mut egui::Ui) {
         let font = FontId::monospace(self.font_size);
-        let wrap = self.word_wrap;
-        let hidden = self.hidden_chars;
         let tab = &mut self.tabs[self.active];
+        let wrap = tab.word_wrap;
+        let hidden = tab.hidden_chars;
+        let mut scroll_end = std::mem::take(&mut tab.scroll_to_end);
         #[allow(deprecated)]
         let id = egui::Id::new(("editor", tab.id));
         let total = tab.text.bytes().filter(|&b| b == b'\n').count() + 1;
@@ -703,6 +732,14 @@ impl App {
                     .inner;
                 if focus {
                     out.response.request_focus();
+                }
+                if scroll_end {
+                    let r = out.response.rect;
+                    ui.scroll_to_rect(
+                        egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - 1.0), r.max),
+                        Some(egui::Align::BOTTOM),
+                    );
+                    scroll_end = false;
                 }
 
                 let galley = &out.galley;
@@ -793,13 +830,17 @@ impl eframe::App for App {
         if zoom != 1.0 {
             self.font_size = (self.font_size * zoom).clamp(6.0, 96.0);
         }
-        if self.filter_open && self.browser.is_none() {
+        if self.browser.is_none() {
+            let tab_tail = self.tabs[self.active].tail;
+            let filter_tail = self.filter_open && self.tail;
             let poll = self.last_poll.elapsed() >= TAIL_POLL;
             if poll {
                 self.last_poll = Instant::now();
             }
-            self.update_filter(poll);
-            if self.tail {
+            if self.filter_open || tab_tail {
+                self.update_filter(poll);
+            }
+            if tab_tail || filter_tail {
                 ctx.request_repaint_after(TAIL_POLL);
             }
         }
