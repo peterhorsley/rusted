@@ -559,6 +559,11 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                if ui.add(egui::Button::new("New").shortcut_text("Ctrl+N")).clicked() {
+                    self.browser = None;
+                    self.new_tab(None, String::new(), false, 0);
+                    ui.close();
+                }
                 if ui.add(egui::Button::new("Open").shortcut_text("Ctrl+O")).clicked() {
                     self.open_browser();
                     ui.close();
@@ -868,6 +873,10 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::N)) {
+            self.browser = None;
+            self.new_tab(None, String::new(), false, 0);
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
             self.open_browser();
         }
