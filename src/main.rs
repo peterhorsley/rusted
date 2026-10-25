@@ -170,7 +170,6 @@ struct App {
     filter_text: String,
     filter_history: Vec<String>,
     case_sensitive: bool,
-    tail: bool,
     applied: (String, bool),
     focus_filter: bool,
     last_poll: Instant,
@@ -264,7 +263,6 @@ impl App {
             filter_text: String::new(),
             filter_history: Vec::new(),
             case_sensitive: false,
-            tail: true,
             applied: (String::new(), false),
             focus_filter: false,
             last_poll: Instant::now(),
@@ -419,18 +417,18 @@ impl App {
 
     // Keeps the active tab's filter results current; with `poll_disk` it also tails the file.
     fn update_filter(&mut self, poll_disk: bool) {
-        let filter_tail = self.filter_open && self.tail;
         let filter_open = self.filter_open;
         let applied = self.applied.clone();
         let tab = &mut self.tabs[self.active];
+        let tailing = tab.tail;
 
         let mut disk_changed = false;
-        if poll_disk && !tab.dirty && (tab.tail || filter_tail) {
+        if poll_disk && tailing {
             if let Some(path) = tab.path.clone() {
                 disk_changed = read_tail(tab, &path);
             }
         }
-        if disk_changed && tab.tail {
+        if disk_changed {
             tab.scroll_to_end = true;
         }
         if !filter_open {
@@ -438,14 +436,14 @@ impl App {
         }
 
         let mut full = tab.filter.applied.as_ref() != Some(&applied);
-        if filter_tail && tab.filter.needs_rescan {
+        if tailing && tab.filter.needs_rescan {
             full = true;
         }
         tab.filter.needs_rescan = false;
         if full {
             tab.filter = FilterState { applied: Some(applied.clone()), ..Default::default() };
             tab.filter.scan(&tab.text, &applied.0, applied.1);
-        } else if disk_changed && filter_tail {
+        } else if disk_changed {
             tab.filter.scan(&tab.text, &applied.0, applied.1);
         }
     }
@@ -478,7 +476,6 @@ impl App {
             if ui.checkbox(&mut self.case_sensitive, "Case sensitive").changed() {
                 search = true;
             }
-            ui.checkbox(&mut self.tail, "Filter tail");
         });
         if search {
             self.apply_search();
@@ -491,7 +488,11 @@ impl App {
         let mut jump = None;
         let results = &tab.filter.results;
         let mut selected = tab.filter.selected;
-        egui::ScrollArea::both().id_salt("filter_results").auto_shrink([false, false]).show_rows(
+        egui::ScrollArea::both()
+            .id_salt("filter_results")
+            .auto_shrink([false, false])
+            .stick_to_bottom(tab.tail)
+            .show_rows(
             ui,
             row_h,
             results.len(),
@@ -517,6 +518,8 @@ impl App {
         if let Some(line) = jump {
             tab.highlight = Some(line);
             tab.scroll_to_highlight = true;
+            tab.scroll_to_end = false;
+            tab.tail = false;
         }
     }
 
@@ -561,6 +564,7 @@ impl App {
                 ui.checkbox(&mut tab.hidden_chars, "Hidden characters");
                 if ui.checkbox(&mut tab.tail, "Tail").changed() && tab.tail {
                     tab.scroll_to_end = true;
+                                    tab.filter.needs_rescan = true;
                 }
             });
         });
@@ -707,6 +711,7 @@ impl App {
         };
 
         let mut status = (total, 1, 1);
+        let tailing = tab.tail;
         let hl = tab.highlight;
         let mut scroll_to = std::mem::take(&mut tab.scroll_to_highlight);
         egui::ScrollArea::both()
@@ -719,7 +724,13 @@ impl App {
                         ui.add_space(gutter_w);
                         let width =
                             if wrap { (avail.x - gutter_w - 16.0).max(50.0) } else { f32::INFINITY };
-                        TextEdit::multiline(&mut tab.text)
+                        let mut ro: &str = &tab.text;
+                        let edit = if tailing {
+                            TextEdit::multiline(&mut ro)
+                        } else {
+                            TextEdit::multiline(&mut tab.text)
+                        };
+                        edit
                             .id(id)
                             .frame(egui::Frame::NONE)
                             .font(font.clone())
@@ -832,7 +843,6 @@ impl eframe::App for App {
         }
         if self.browser.is_none() {
             let tab_tail = self.tabs[self.active].tail;
-            let filter_tail = self.filter_open && self.tail;
             let poll = self.last_poll.elapsed() >= TAIL_POLL;
             if poll {
                 self.last_poll = Instant::now();
@@ -840,7 +850,7 @@ impl eframe::App for App {
             if self.filter_open || tab_tail {
                 self.update_filter(poll);
             }
-            if tab_tail || filter_tail {
+            if tab_tail {
                 ctx.request_repaint_after(TAIL_POLL);
             }
         }
