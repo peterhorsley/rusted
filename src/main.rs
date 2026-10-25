@@ -66,6 +66,11 @@ struct Tab {
     filter: FilterState,
     highlight: Option<usize>,
     scroll_to_highlight: bool,
+    filter_open: bool,
+    filter_text: String,
+    case_sensitive: bool,
+    applied: (String, bool),
+    focus_filter: bool,
     word_wrap: bool,
     hidden_chars: bool,
     tail: bool,
@@ -166,12 +171,7 @@ struct App {
     browser: Option<Browser>,
     message: Option<String>,
     focus_editor: bool,
-    filter_open: bool,
-    filter_text: String,
     filter_history: Vec<String>,
-    case_sensitive: bool,
-    applied: (String, bool),
-    focus_filter: bool,
     last_poll: Instant,
     status: (usize, usize, usize),
 }
@@ -278,12 +278,7 @@ impl App {
             browser: None,
             message: None,
             focus_editor: true,
-            filter_open: false,
-            filter_text: String::new(),
             filter_history: Vec::new(),
-            case_sensitive: false,
-            applied: (String::new(), false),
-            focus_filter: false,
             last_poll: Instant::now(),
             status: (1, 1, 1),
         };
@@ -307,6 +302,11 @@ impl App {
             filter: FilterState::default(),
             highlight: None,
             scroll_to_highlight: false,
+            filter_open: false,
+            filter_text: String::new(),
+            case_sensitive: false,
+            applied: (String::new(), false),
+            focus_filter: false,
             word_wrap: false,
             hidden_chars: false,
             tail: false,
@@ -425,31 +425,33 @@ impl App {
     }
 
     fn toggle_filter(&mut self) {
-        self.filter_open = !self.filter_open;
-        if self.filter_open {
-            self.focus_filter = true;
+        let tab = &mut self.tabs[self.active];
+        tab.filter_open = !tab.filter_open;
+        if tab.filter_open {
+            tab.focus_filter = true;
         } else {
             self.focus_editor = true;
         }
     }
 
     fn apply_search(&mut self) {
-        let text = self.filter_text.clone();
+        let tab = &mut self.tabs[self.active];
+        let text = tab.filter_text.clone();
         if !text.is_empty() {
             self.filter_history.retain(|h| h != &text);
             self.filter_history.insert(0, text.clone());
             self.filter_history.truncate(MAX_FILTER_HISTORY);
         }
-        self.applied = (text, self.case_sensitive);
-        self.tabs[self.active].filter.applied = None;
+        tab.applied = (text, tab.case_sensitive);
+        tab.filter.applied = None;
         self.update_filter(false);
     }
 
     // Keeps the active tab's filter results current; with `poll_disk` it also tails the file.
     fn update_filter(&mut self, poll_disk: bool) {
-        let filter_open = self.filter_open;
-        let applied = self.applied.clone();
         let tab = &mut self.tabs[self.active];
+        let filter_open = tab.filter_open;
+        let applied = tab.applied.clone();
         let tailing = tab.tail;
 
         let mut disk_changed = false;
@@ -480,20 +482,22 @@ impl App {
 
     fn filter_ui(&mut self, ui: &mut egui::Ui) {
         let mut search = false;
+        let history = self.filter_history.clone();
+        let tab = &mut self.tabs[self.active];
         ui.horizontal(|ui| {
             ui.label("Filter:");
-            let r = ui.add(TextEdit::singleline(&mut self.filter_text).desired_width(320.0));
-            if std::mem::take(&mut self.focus_filter) {
+            let r = ui.add(TextEdit::singleline(&mut tab.filter_text).desired_width(320.0));
+            if std::mem::take(&mut tab.focus_filter) {
                 r.request_focus();
             }
             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 search = true;
             }
-            ui.add_enabled_ui(!self.filter_history.is_empty(), |ui| {
+            ui.add_enabled_ui(!history.is_empty(), |ui| {
                 ui.menu_button("▾", |ui| {
-                    for h in self.filter_history.clone() {
+                    for h in history {
                         if ui.button(&h).clicked() {
-                            self.filter_text = h;
+                            tab.filter_text = h;
                             search = true;
                             ui.close();
                         }
@@ -503,7 +507,7 @@ impl App {
             if ui.button("Search").clicked() {
                 search = true;
             }
-            if ui.checkbox(&mut self.case_sensitive, "Case sensitive").changed() {
+            if ui.checkbox(&mut tab.case_sensitive, "Case sensitive").changed() {
                 search = true;
             }
         });
@@ -522,7 +526,7 @@ impl App {
         let results = &tab.filter.results;
         let mut selected = tab.filter.selected;
         egui::ScrollArea::both()
-            .id_salt("filter_results")
+            .id_salt(("filter_results", tab.id))
             .auto_shrink([false, false])
             .stick_to_bottom(tab.tail)
             .show_rows(
@@ -903,7 +907,7 @@ impl eframe::App for App {
             if poll {
                 self.last_poll = Instant::now();
             }
-            if self.filter_open || tab_tail {
+            if self.tabs[self.active].filter_open || tab_tail {
                 self.update_filter(poll);
             }
             if tab_tail {
@@ -924,8 +928,8 @@ impl eframe::App for App {
                 }
             });
         });
-        if self.filter_open && self.browser.is_none() {
-            egui::Panel::bottom("filter")
+        if self.tabs[self.active].filter_open && self.browser.is_none() {
+            egui::Panel::bottom(("filter", self.tabs[self.active].id))
                 .resizable(true)
                 .default_size(260.0)
                 .min_size(60.0)
