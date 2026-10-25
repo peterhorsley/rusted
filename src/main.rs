@@ -2,15 +2,70 @@
 
 use eframe::egui::{self, Color32, FontId, Key, Modifiers, RichText, TextEdit};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const MAX_RECENT: usize = 10;
 const DEFAULT_FONT_SIZE: f32 = 14.0;
+
+const MAX_FILTER_HISTORY: usize = 10;
+const TAIL_POLL: Duration = Duration::from_millis(400);
+
+#[derive(Default)]
+struct FilterState {
+    // (0-based line number, line text)
+    results: Vec<(usize, String)>,
+    // Byte offset and line number of the first line not yet fully scanned.
+    offset: usize,
+    line: usize,
+    applied: Option<(String, bool)>,
+    selected: Option<usize>,
+    needs_rescan: bool,
+}
+
+impl FilterState {
+    fn scan(&mut self, text: &str, pat: &str, case: bool) {
+        let keep = self.line;
+        self.results.retain(|r| r.0 < keep);
+        if self.offset > text.len() || !text.is_char_boundary(self.offset) {
+            self.results.clear();
+            self.offset = 0;
+            self.line = 0;
+        }
+        let needle = if case { pat.to_owned() } else { pat.to_lowercase() };
+        let (mut off, mut line) = (self.offset, self.line);
+        while off < text.len() {
+            let rest = &text[off..];
+            let (l, terminated) = match rest.find('\n') {
+                Some(i) => (&rest[..i], true),
+                None => (rest, false),
+            };
+            let hit = needle.is_empty()
+                || if case { l.contains(&needle) } else { l.to_lowercase().contains(&needle) };
+            if hit {
+                self.results.push((line, l.to_owned()));
+            }
+            if !terminated {
+                break;
+            }
+            off += l.len() + 1;
+            line += 1;
+        }
+        self.offset = off;
+        self.line = line;
+    }
+}
 
 struct Tab {
     id: u64,
     path: Option<PathBuf>,
     text: String,
     crlf: bool,
+    // Bytes of the file on disk that are reflected in `text`.
+    disk_len: u64,
+    dirty: bool,
+    filter: FilterState,
+    highlight: Option<usize>,
+    scroll_to_highlight: bool,
 }
 
 impl Tab {
@@ -109,6 +164,14 @@ struct App {
     browser: Option<Browser>,
     message: Option<String>,
     focus_editor: bool,
+    filter_open: bool,
+    filter_text: String,
+    filter_history: Vec<String>,
+    case_sensitive: bool,
+    tail: bool,
+    applied: (String, bool),
+    focus_filter: bool,
+    last_poll: Instant,
     status: (usize, usize, usize),
 }
 
@@ -130,6 +193,47 @@ fn load_recent() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+// Appends any complete lines added to the file on disk since the last read.
+// Returns true when `text` changed.
+fn read_tail(tab: &mut Tab, path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    let len = meta.len();
+    if len == tab.disk_len {
+        return false;
+    }
+    if len < tab.disk_len {
+        // File was truncated or replaced: reload from scratch.
+        let Ok(bytes) = std::fs::read(path) else { return false };
+        let s = String::from_utf8_lossy(&bytes).into_owned();
+        tab.crlf = s.contains("\r\n");
+        tab.text = if tab.crlf { s.replace("\r\n", "\n") } else { s };
+        tab.disk_len = bytes.len() as u64;
+        tab.highlight = None;
+        tab.filter.needs_rescan = true;
+        return true;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    if f.seek(SeekFrom::Start(tab.disk_len)).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if f.take(len - tab.disk_len).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    // Only consume whole lines so partial writes and split UTF-8 sequences wait for the next poll.
+    let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return false };
+    buf.truncate(end + 1);
+    let s = String::from_utf8_lossy(&buf);
+    if tab.crlf {
+        tab.text.push_str(&s.replace("\r\n", "\n"));
+    } else {
+        tab.text.push_str(&s);
+    }
+    tab.disk_len += buf.len() as u64;
+    true
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
@@ -144,19 +248,37 @@ impl App {
             browser: None,
             message: None,
             focus_editor: true,
+            filter_open: false,
+            filter_text: String::new(),
+            filter_history: Vec::new(),
+            case_sensitive: false,
+            tail: true,
+            applied: (String::new(), false),
+            focus_filter: false,
+            last_poll: Instant::now(),
             status: (1, 1, 1),
         };
         if let Some(p) = file {
             app.open_path(p);
         }
         if app.tabs.is_empty() {
-            app.new_tab(None, String::new(), false);
+            app.new_tab(None, String::new(), false, 0);
         }
         app
     }
 
-    fn new_tab(&mut self, path: Option<PathBuf>, text: String, crlf: bool) {
-        self.tabs.push(Tab { id: self.next_id, path, text, crlf });
+    fn new_tab(&mut self, path: Option<PathBuf>, text: String, crlf: bool, disk_len: u64) {
+        self.tabs.push(Tab {
+            id: self.next_id,
+            path,
+            text,
+            crlf,
+            disk_len,
+            dirty: false,
+            filter: FilterState::default(),
+            highlight: None,
+            scroll_to_highlight: false,
+        });
         self.next_id += 1;
         self.active = self.tabs.len() - 1;
         self.focus_editor = true;
@@ -170,11 +292,16 @@ impl App {
             self.add_recent(path);
             return;
         }
-        let (text, crlf) = if path.exists() {
+        let (text, crlf, len) = if path.exists() {
             match std::fs::read(&path) {
                 Ok(bytes) => {
+                    let len = bytes.len() as u64;
                     let s = String::from_utf8_lossy(&bytes).into_owned();
-                    if s.contains("\r\n") { (s.replace("\r\n", "\n"), true) } else { (s, false) }
+                    if s.contains("\r\n") {
+                        (s.replace("\r\n", "\n"), true, len)
+                    } else {
+                        (s, false, len)
+                    }
                 }
                 Err(e) => {
                     self.message = Some(format!("Cannot open {}: {e}", path.display()));
@@ -182,14 +309,14 @@ impl App {
                 }
             }
         } else {
-            (String::new(), false)
+            (String::new(), false, 0)
         };
         // Replace a pristine empty untitled tab instead of stacking on it.
         if self.tabs.len() == 1 && self.tabs[0].path.is_none() && self.tabs[0].text.is_empty() {
             self.tabs.clear();
         }
         self.add_recent(path.clone());
-        self.new_tab(Some(path), text, crlf);
+        self.new_tab(Some(path), text, crlf, len);
         self.message = None;
     }
 
@@ -210,9 +337,12 @@ impl App {
         let path = std::path::absolute(&path).unwrap_or(path);
         let tab = &mut self.tabs[idx];
         let data = if tab.crlf { tab.text.replace('\n', "\r\n") } else { tab.text.clone() };
-        match std::fs::write(&path, data) {
+        match std::fs::write(&path, &data) {
             Ok(()) => {
                 tab.path = Some(path.clone());
+                tab.dirty = false;
+                tab.disk_len = data.len() as u64;
+                tab.filter.needs_rescan = true;
                 self.message = None;
                 self.add_recent(path);
             }
@@ -250,6 +380,122 @@ impl App {
         self.focus_editor = true;
     }
 
+    fn toggle_filter(&mut self) {
+        self.filter_open = !self.filter_open;
+        if self.filter_open {
+            self.focus_filter = true;
+        } else {
+            self.focus_editor = true;
+        }
+    }
+
+    fn apply_search(&mut self) {
+        let text = self.filter_text.clone();
+        if !text.is_empty() {
+            self.filter_history.retain(|h| h != &text);
+            self.filter_history.insert(0, text.clone());
+            self.filter_history.truncate(MAX_FILTER_HISTORY);
+        }
+        self.applied = (text, self.case_sensitive);
+        self.tabs[self.active].filter.applied = None;
+        self.update_filter(false);
+    }
+
+    // Keeps the active tab's filter results current; with `poll_disk` it also tails the file.
+    fn update_filter(&mut self, poll_disk: bool) {
+        let tail = self.tail;
+        let applied = self.applied.clone();
+        let tab = &mut self.tabs[self.active];
+        let mut full = tab.filter.applied.as_ref() != Some(&applied);
+        if tail && tab.filter.needs_rescan {
+            full = true;
+        }
+        tab.filter.needs_rescan = false;
+
+        let mut changed = full;
+        if poll_disk && tail && !tab.dirty {
+            if let Some(path) = tab.path.clone() {
+                changed |= read_tail(tab, &path);
+            }
+        }
+        if full {
+            tab.filter = FilterState { applied: Some(applied.clone()), ..Default::default() };
+            tab.filter.scan(&tab.text, &applied.0, applied.1);
+        } else if changed {
+            tab.filter.scan(&tab.text, &applied.0, applied.1);
+        }
+    }
+
+    fn filter_ui(&mut self, ui: &mut egui::Ui) {
+        let mut search = false;
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            let r = ui.add(TextEdit::singleline(&mut self.filter_text).desired_width(320.0));
+            if std::mem::take(&mut self.focus_filter) {
+                r.request_focus();
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                search = true;
+            }
+            ui.add_enabled_ui(!self.filter_history.is_empty(), |ui| {
+                ui.menu_button("▾", |ui| {
+                    for h in self.filter_history.clone() {
+                        if ui.button(&h).clicked() {
+                            self.filter_text = h;
+                            search = true;
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            if ui.button("Search").clicked() {
+                search = true;
+            }
+            if ui.checkbox(&mut self.case_sensitive, "Case sensitive").changed() {
+                search = true;
+            }
+            ui.checkbox(&mut self.tail, "Filter tail");
+        });
+        if search {
+            self.apply_search();
+        }
+        ui.separator();
+
+        let font = FontId::monospace(self.font_size);
+        let row_h = ui.fonts_mut(|f| f.row_height(&font)) + ui.spacing().item_spacing.y;
+        let tab = &mut self.tabs[self.active];
+        let mut jump = None;
+        let results = &tab.filter.results;
+        let mut selected = tab.filter.selected;
+        egui::ScrollArea::both().id_salt("filter_results").auto_shrink([false, false]).show_rows(
+            ui,
+            row_h,
+            results.len(),
+            |ui, range| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                    for i in range {
+                        let (line, text) = &results[i];
+                        let label = RichText::new(format!("{:>6}  {}", line + 1, text)).font(font.clone());
+                        let r = ui.selectable_label(selected == Some(i), label);
+                        if r.clicked() {
+                            selected = Some(i);
+                        }
+                        if r.double_clicked() {
+                            selected = Some(i);
+                            jump = Some(*line);
+                        }
+                    }
+                });
+            },
+        );
+        tab.filter.selected = selected;
+        if let Some(line) = jump {
+            tab.highlight = Some(line);
+            tab.scroll_to_highlight = true;
+        }
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
@@ -278,6 +524,10 @@ impl App {
                 }
                 if ui.button("Save As").clicked() {
                     self.save_as();
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Filter / find").shortcut_text("F4 / Ctrl+F")).clicked() {
+                    self.toggle_filter();
                     ui.close();
                 }
             });
@@ -428,6 +678,8 @@ impl App {
         };
 
         let mut status = (total, 1, 1);
+        let hl = tab.highlight;
+        let mut scroll_to = std::mem::take(&mut tab.scroll_to_highlight);
         egui::ScrollArea::both()
             .id_salt(("scroll", tab.id))
             .auto_shrink([false, false])
@@ -497,10 +749,27 @@ impl App {
                             Color32::from_gray(90),
                         );
                     }
+                    if let Some(h) = hl {
+                        if line - 1 == h {
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(clip.left() + gutter_w, y),
+                                egui::vec2(clip.width() - gutter_w, row_h),
+                            );
+                            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 214, 0, 55));
+                            if scroll_to {
+                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                scroll_to = false;
+                            }
+                        }
+                    }
                     new_line = row.ends_with_newline;
                     if new_line {
                         line += 1;
                     }
+                }
+                if out.response.changed() {
+                    tab.dirty = true;
+                    tab.highlight = None;
                 }
             });
         self.status = status;
@@ -515,9 +784,24 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
             self.save();
         }
+        if ctx.input_mut(|i| {
+            i.consume_key(Modifiers::NONE, Key::F4) | i.consume_key(Modifiers::COMMAND, Key::F)
+        }) {
+            self.toggle_filter();
+        }
         let zoom = ctx.input(|i| i.zoom_delta());
         if zoom != 1.0 {
             self.font_size = (self.font_size * zoom).clamp(6.0, 96.0);
+        }
+        if self.filter_open && self.browser.is_none() {
+            let poll = self.last_poll.elapsed() >= TAIL_POLL;
+            if poll {
+                self.last_poll = Instant::now();
+            }
+            self.update_filter(poll);
+            if self.tail {
+                ctx.request_repaint_after(TAIL_POLL);
+            }
         }
     }
 
@@ -533,6 +817,13 @@ impl eframe::App for App {
                 }
             });
         });
+        if self.filter_open && self.browser.is_none() {
+            egui::Panel::bottom("filter")
+                .resizable(true)
+                .default_size(260.0)
+                .min_size(60.0)
+                .show(root, |ui| self.filter_ui(ui));
+        }
         egui::CentralPanel::default().show(root, |ui| {
             if self.browser.is_some() {
                 self.browser_ui(ui);
