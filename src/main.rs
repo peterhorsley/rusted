@@ -1040,14 +1040,17 @@ fn save_window(w: &WindowState) {
 fn main() -> eframe::Result {
     let file = std::env::args_os().nth(1).map(PathBuf::from);
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("rusted");
+    let mut centered = true;
     if let Some(w) = load_window() {
         viewport = viewport.with_inner_size(w.size).with_maximized(w.maximized);
         if let Some(p) = w.pos {
             viewport = viewport.with_position(p);
+            centered = false;
         }
     }
     let options = eframe::NativeOptions {
         viewport,
+        centered,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
