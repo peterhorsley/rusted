@@ -194,6 +194,19 @@ fn load_recent() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+// True when the user pressed the mouse or scrolled the wheel over `rect`.
+fn user_interacted(ui: &egui::Ui, rect: egui::Rect) -> bool {
+    ui.input(|i| {
+        let Some(pos) = i.pointer.hover_pos() else { return false };
+        if !rect.contains(pos) {
+            return false;
+        }
+        i.pointer.primary_pressed()
+            || (!i.modifiers.command
+                && i.raw.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. })))
+    })
+}
+
 // Replaces the tab's contents with the file on disk, discarding unsaved edits.
 fn reload_from_disk(tab: &mut Tab, path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else { return false };
@@ -502,6 +515,9 @@ impl App {
         let font = FontId::monospace(self.font_size);
         let row_h = ui.fonts_mut(|f| f.row_height(&font)) + ui.spacing().item_spacing.y;
         let tab = &mut self.tabs[self.active];
+        if tab.tail && user_interacted(ui, ui.available_rect_before_wrap()) {
+            tab.tail = false;
+        }
         let mut jump = None;
         let results = &tab.filter.results;
         let mut selected = tab.filter.selected;
@@ -702,6 +718,9 @@ impl App {
     fn editor_ui(&mut self, ui: &mut egui::Ui) {
         let font = FontId::monospace(self.font_size);
         let tab = &mut self.tabs[self.active];
+        if tab.tail && user_interacted(ui, ui.available_rect_before_wrap()) {
+            tab.tail = false;
+        }
         let wrap = tab.word_wrap;
         let hidden = tab.hidden_chars;
         let mut scroll_end = std::mem::take(&mut tab.scroll_to_end);
