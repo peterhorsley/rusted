@@ -39,8 +39,8 @@ impl FilterState {
                 Some(i) => (&rest[..i], true),
                 None => (rest, false),
             };
-            let hit = needle.is_empty()
-                || if case { l.contains(&needle) } else { l.to_lowercase().contains(&needle) };
+            let hit = !needle.is_empty()
+                && if case { l.contains(&needle) } else { l.to_lowercase().contains(&needle) };
             if hit {
                 self.results.push((line, l.to_owned()));
             }
@@ -194,6 +194,19 @@ fn load_recent() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+// Replaces the tab's contents with the file on disk, discarding unsaved edits.
+fn reload_from_disk(tab: &mut Tab, path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else { return false };
+    let s = String::from_utf8_lossy(&bytes).into_owned();
+    tab.crlf = s.contains("\r\n");
+    tab.text = if tab.crlf { s.replace("\r\n", "\n") } else { s };
+    tab.disk_len = bytes.len() as u64;
+    tab.dirty = false;
+    tab.highlight = None;
+    tab.filter.needs_rescan = true;
+    true
+}
+
 // Appends any complete lines added to the file on disk since the last read.
 // Returns true when `text` changed.
 fn read_tail(tab: &mut Tab, path: &Path) -> bool {
@@ -205,14 +218,7 @@ fn read_tail(tab: &mut Tab, path: &Path) -> bool {
     }
     if len < tab.disk_len {
         // File was truncated or replaced: reload from scratch.
-        let Ok(bytes) = std::fs::read(path) else { return false };
-        let s = String::from_utf8_lossy(&bytes).into_owned();
-        tab.crlf = s.contains("\r\n");
-        tab.text = if tab.crlf { s.replace("\r\n", "\n") } else { s };
-        tab.disk_len = bytes.len() as u64;
-        tab.highlight = None;
-        tab.filter.needs_rescan = true;
-        return true;
+        return reload_from_disk(tab, path);
     }
     let Ok(mut f) = std::fs::File::open(path) else { return false };
     if f.seek(SeekFrom::Start(tab.disk_len)).is_err() {
@@ -563,8 +569,10 @@ impl App {
                 ui.checkbox(&mut tab.word_wrap, "Word wrap");
                 ui.checkbox(&mut tab.hidden_chars, "Hidden characters");
                 if ui.checkbox(&mut tab.tail, "Tail").changed() && tab.tail {
-                    tab.scroll_to_end = true;
-                                    tab.filter.needs_rescan = true;
+                                    if let Some(p) = tab.path.clone() {
+                                        reload_from_disk(tab, &p);
+                                    }
+                                    tab.scroll_to_end = true;
                 }
             });
         });
