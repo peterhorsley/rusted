@@ -194,6 +194,25 @@ fn load_recent() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+// Small rotating ring of fading dots drawn at the left edge of a tab label.
+fn paint_spinner(ui: &egui::Ui, label: &egui::Response) {
+    let size = egui::TextStyle::Body.resolve(ui.style()).size * 0.8;
+    let center = egui::pos2(
+        label.rect.left() + ui.spacing().button_padding.x + size / 2.0,
+        label.rect.center().y,
+    );
+    let t = ui.input(|i| i.time);
+    let head = (t * 10.0) as usize % 8;
+    let color = Color32::from_rgb(90, 200, 120);
+    for k in 0..8usize {
+        let a = k as f32 * std::f32::consts::TAU / 8.0;
+        let pos = center + egui::vec2(a.cos(), a.sin()) * (size / 2.0 - 1.0);
+        let age = (head + 8 - k) % 8;
+        let alpha = 255 - (age * 30) as u8;
+        ui.painter().circle_filled(pos, 1.3, color.gamma_multiply(alpha as f32 / 255.0));
+    }
+}
+
 // True when the user pressed the mouse or scrolled the wheel over `rect`.
 fn user_interacted(ui: &egui::Ui, rect: egui::Rect) -> bool {
     ui.input(|i| {
@@ -622,7 +641,19 @@ impl App {
         ui.horizontal(|ui| {
             let mut select = None;
             for (i, t) in self.tabs.iter().enumerate() {
-                let mut r = ui.selectable_label(self.browser.is_none() && i == self.active, t.title());
+                let title = if t.tail {
+                    // Leave room for the spinner painted over the start of the label.
+                    let body = egui::TextStyle::Body.resolve(ui.style());
+                    let space_w = ui.fonts_mut(|f| f.glyph_width(&body, ' ')).max(1.0);
+                    let n = (body.size / space_w).ceil() as usize + 1;
+                    format!("{}{}", " ".repeat(n), t.title())
+                } else {
+                    t.title()
+                };
+                let mut r = ui.selectable_label(self.browser.is_none() && i == self.active, title);
+                if t.tail {
+                    paint_spinner(ui, &r);
+                }
                 if let Some(p) = &t.path {
                     r = r.on_hover_text(p.to_string_lossy());
                 }
@@ -912,6 +943,9 @@ impl eframe::App for App {
             }
             if tab_tail {
                 ctx.request_repaint_after(TAIL_POLL);
+            }
+            if self.tabs.iter().any(|t| t.tail) {
+                ctx.request_repaint_after(Duration::from_millis(50));
             }
         }
     }
