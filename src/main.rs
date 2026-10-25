@@ -400,6 +400,17 @@ impl App {
         self.focus_editor = true;
     }
 
+    fn reload(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        let Some(path) = tab.path.clone() else { return };
+        if !reload_from_disk(tab, &path) {
+            self.message = Some(format!("Cannot reload {}", path.display()));
+        } else {
+            self.message = None;
+            self.focus_editor = true;
+        }
+    }
+
     fn toggle_filter(&mut self) {
         self.filter_open = !self.filter_open;
         if self.filter_open {
@@ -557,6 +568,10 @@ impl App {
                 }
                 if ui.button("Save As").clicked() {
                     self.save_as();
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Reload").shortcut_text("F5 / Ctrl+R")).clicked() {
+                    self.reload();
                     ui.close();
                 }
                 if ui.add(egui::Button::new("Filter / find").shortcut_text("F4 / Ctrl+F")).clicked() {
@@ -839,6 +854,11 @@ impl eframe::App for App {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
             self.save();
+        }
+        if ctx.input_mut(|i| {
+            i.consume_key(Modifiers::NONE, Key::F5) | i.consume_key(Modifiers::COMMAND, Key::R)
+        }) {
+            self.reload();
         }
         if ctx.input_mut(|i| {
             i.consume_key(Modifiers::NONE, Key::F4) | i.consume_key(Modifiers::COMMAND, Key::F)
