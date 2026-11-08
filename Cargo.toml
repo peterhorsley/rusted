@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "glow", "default_fonts", "x11", "wayland"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+arboard = { version = "3.7", default-features = false }
 
 [profile.release]
 opt-level = 3

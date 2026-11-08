@@ -59,5 +59,19 @@ rusted.exe [file]
 An optional single argument is the path of a file to open; without it an empty
 editor opens.
 
+The Edit menu provides undo, redo, cut, copy and paste. The About > Program
+menu shows the application version. The toolbar beneath the file tabs opens
+Filter / Find and controls word wrap, hidden characters and tailing for the current tab.
+Use Ctrl+W, Ctrl+E and Ctrl+T respectively to toggle them.
+Enabling tail reloads the file and discards any unsaved edits; editing actions
+are disabled while tailing. Toolbar icons are embedded in the executable.
+
 Settings and history are stored in `%APPDATA%\rusted` (recent files and window
 position).
+
+TODO
+----
+- Syntax highlighting
+- Add link to github on about dialog
+- Row highlighting on filtered matches with custom color
+-

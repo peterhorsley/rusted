@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 const MAX_RECENT: usize = 10;
 const DEFAULT_FONT_SIZE: f32 = 14.0;
+const APP_ICON: &[u8] = include_bytes!("assets/app.png");
 
 const MAX_FILTER_HISTORY: usize = 10;
 const TAIL_POLL: Duration = Duration::from_millis(400);
@@ -289,6 +290,80 @@ impl Browser {
     }
 }
 
+struct ToolbarIcons {
+    find: egui::TextureHandle,
+    wrap: egui::TextureHandle,
+    hidden: egui::TextureHandle,
+    tail: egui::TextureHandle,
+}
+
+enum EditAction {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+}
+
+fn history_steps(state: &egui::text_edit::TextEditState, text: &str, redo: bool) -> usize {
+    let Some(range) = state.cursor.char_range() else { return 0 };
+    let mut undoer = state.undoer();
+    let mut current = (range, text.to_owned());
+    let mut steps = 0;
+    loop {
+        let next = if redo { undoer.redo(&current) } else { undoer.undo(&current) };
+        let Some(next) = next.cloned() else { return 0 };
+        steps += 1;
+        if next.1 != text {
+            return steps;
+        }
+        current = next;
+    }
+}
+
+fn clipboard_has_text() -> Result<bool, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+    match clipboard.get_text() {
+        Ok(text) => Ok(!text.is_empty()),
+        Err(arboard::Error::ContentNotAvailable) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+struct PendingEdit {
+    tab_id: u64,
+    action: EditAction,
+    selection: Option<egui::text::CCursorRange>,
+    ready: bool,
+}
+
+fn load_icon(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Result<egui::TextureHandle, String> {
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .map_err(|error| format!("Cannot load {name} icon: {error}"))?
+        .into_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    Ok(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
+}
+
+impl ToolbarIcons {
+    fn load(ctx: &egui::Context) -> Result<Self, String> {
+        Ok(Self {
+            find: load_icon(ctx, "find", include_bytes!("assets/find.png"))?,
+            wrap: load_icon(ctx, "wordwrap", include_bytes!("assets/wordwrap.png"))?,
+            hidden: load_icon(ctx, "hidden", include_bytes!("assets/hidden-characters.png"))?,
+            tail: load_icon(ctx, "tail", include_bytes!("assets/tail.png"))?,
+        })
+    }
+}
+
+fn toolbar_button(icon: &egui::TextureHandle, label: &str, selected: bool) -> egui::Button<'static> {
+    let native = icon.size_vec2();
+    let size = native * (20.0 / native.x.max(native.y));
+    let image = egui::Image::new((icon.id(), size));
+    egui::Button::image_and_text(image, label.to_owned()).selected(selected)
+}
+
 struct App {
     tabs: Vec<Tab>,
     active: usize,
@@ -299,6 +374,15 @@ struct App {
     message: Option<String>,
     focus_editor: bool,
     filter_history: Vec<String>,
+    toolbar_icons: Option<Result<ToolbarIcons, String>>,
+    about_open: bool,
+    about_icon: Option<Result<egui::TextureHandle, String>>,
+    editor_selection: Option<(u64, egui::text::CCursorRange)>,
+    pending_edit: Option<PendingEdit>,
+    edit_menu_open: bool,
+    clipboard_status: Result<bool, String>,
+    #[cfg(test)]
+    clipboard_test_status: Option<Result<bool, String>>,
     window: WindowState,
     last_poll: Instant,
     status: (usize, usize, usize),
@@ -342,15 +426,13 @@ fn paint_spinner(ui: &egui::Ui, label: &egui::Response) {
 
 // True when the user pressed the mouse or scrolled the wheel over `rect`.
 fn user_interacted(ui: &egui::Ui, rect: egui::Rect) -> bool {
-    ui.input(|i| {
-        let Some(pos) = i.pointer.hover_pos() else { return false };
-        if !rect.contains(pos) {
-            return false;
-        }
-        i.pointer.primary_pressed()
+    let (pos, interacted) = ui.input(|i| {
+        let Some(pos) = i.pointer.hover_pos() else { return (None, false) };
+        (Some(pos), i.pointer.primary_pressed()
             || (!i.modifiers.command
-                && i.raw.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. })))
-    })
+                && i.raw.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. }))))
+    });
+    interacted && pos.is_some_and(|p| rect.contains(p) && ui.ctx().layer_id_at(p) == Some(ui.layer_id()))
 }
 
 // Replaces the tab's contents with the file on disk, discarding unsaved edits.
@@ -413,6 +495,65 @@ fn read_tail(tab: &mut Tab, path: &Path) -> bool {
 }
 
 impl App {
+    fn toggle_tail(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        if tab.tail {
+            tab.tail = false;
+        } else {
+            if let Some(path) = tab.path.clone() {
+                if !reload_from_disk(tab, &path) {
+                    self.message = Some(format!("Cannot reload {}", path.display()));
+                    return;
+                }
+            }
+            tab.tail = true;
+            tab.scroll_to_end = true;
+        }
+    }
+
+    fn view_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.browser.is_none() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::W)) {
+                let tab = &mut self.tabs[self.active];
+                tab.word_wrap = !tab.word_wrap;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::E)) {
+                let tab = &mut self.tabs[self.active];
+                tab.hidden_chars = !tab.hidden_chars;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T)) {
+                self.toggle_tail();
+            }
+        }
+    }
+
+    fn edit_availability(&self, ui: &egui::Ui) -> (bool, bool, bool) {
+        let tab = &self.tabs[self.active];
+        #[allow(deprecated)]
+        let id = egui::Id::new(("editor", tab.id));
+        let state = egui::text_edit::TextEditState::load(ui.ctx(), id);
+        let undo = state.as_ref().is_some_and(|s| history_steps(s, &tab.text, false) > 0);
+        let redo = state.as_ref().is_some_and(|s| history_steps(s, &tab.text, true) > 0);
+        let selected = if let Some(selection) = tab.col_sel {
+            let shown: String = if tab.hidden_chars {
+                tab.text.chars().map(|c| if c == ' ' { '·' } else { c }).collect()
+            } else {
+                tab.text.clone()
+            };
+            let job = egui::text::LayoutJob::simple(
+                shown, FontId::monospace(self.font_size), Color32::WHITE, f32::INFINITY,
+            );
+            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+            column_text(&tab.text, &selection, &galley).chars().any(|c| c != '\n')
+        } else {
+            self.editor_selection
+                .filter(|(id, _)| *id == tab.id)
+                .map(|(_, range)| !range.is_empty())
+                .unwrap_or(false)
+        };
+        (undo, redo, selected)
+    }
+
     fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         cc.egui_ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
@@ -426,6 +567,15 @@ impl App {
             message: None,
             focus_editor: true,
             filter_history: Vec::new(),
+            toolbar_icons: None,
+            about_open: false,
+            about_icon: None,
+            editor_selection: None,
+            pending_edit: None,
+            edit_menu_open: false,
+            clipboard_status: Ok(false),
+            #[cfg(test)]
+            clipboard_test_status: None,
             window: load_window().unwrap_or(WindowState {
                 pos: None,
                 size: egui::vec2(1000.0, 700.0),
@@ -753,23 +903,133 @@ impl App {
                     self.reload();
                     ui.close();
                 }
-                if ui.add(egui::Button::new("Filter / find").shortcut_text("F4 / Ctrl+F")).clicked() {
+                if ui.add(egui::Button::new("Filter / Find").shortcut_text("F4 / Ctrl+F")).clicked() {
                     self.toggle_filter();
                     ui.close();
                 }
             });
-            ui.menu_button("View", |ui| {
-                let tab = &mut self.tabs[self.active];
-                ui.checkbox(&mut tab.word_wrap, "Word wrap");
-                ui.checkbox(&mut tab.hidden_chars, "Hidden characters");
-                if ui.checkbox(&mut tab.tail, "Tail").changed() && tab.tail {
-                                    if let Some(p) = tab.path.clone() {
-                                        reload_from_disk(tab, &p);
-                                    }
-                                    tab.scroll_to_end = true;
+            let editable = self.browser.is_none() && !self.tabs[self.active].tail;
+            let mut action = None;
+            let menu = ui.menu_button("Edit", |ui| {
+                let (can_undo, can_redo, selected) = self.edit_availability(ui);
+                if !self.edit_menu_open {
+                    #[cfg(test)]
+                    let status = self.clipboard_test_status.clone().unwrap_or_else(clipboard_has_text);
+                    #[cfg(not(test))]
+                    let status = clipboard_has_text();
+                    self.clipboard_status = status;
+                }
+                self.edit_menu_open = true;
+                for (label, shortcut, enabled, command) in [
+                    ("Undo", "Ctrl+Z", editable && can_undo, EditAction::Undo),
+                    ("Redo", "Ctrl+Y", editable && can_redo, EditAction::Redo),
+                    ("Cut", "Ctrl+X", editable && selected, EditAction::Cut),
+                    ("Copy", "Ctrl+C", self.browser.is_none() && selected, EditAction::Copy),
+                    ("Paste", "Ctrl+V", editable && matches!(self.clipboard_status, Ok(true)), EditAction::Paste),
+                ] {
+                    if ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut)).clicked() {
+                        action = Some(command);
+                        ui.close();
+                    }
+                    if label == "Redo" {
+                        ui.separator();
+                    }
+                }
+                if let Err(error) = &self.clipboard_status {
+                    ui.colored_label(Color32::LIGHT_RED, format!("Clipboard unavailable: {error}"));
+                }
+            });
+            if menu.inner.is_none() {
+                self.edit_menu_open = false;
+            }
+            if let Some(action) = action {
+                let tab_id = self.tabs[self.active].id;
+                let selection = self.editor_selection.take()
+                    .and_then(|(id, range)| if id == tab_id { Some(range) } else { None });
+                self.pending_edit = Some(PendingEdit { tab_id, action, selection, ready: false });
+                ui.ctx().request_repaint();
+            }
+            ui.menu_button("Program", |ui| {
+                if ui.button("About").clicked() {
+                    self.about_open = true;
+                    ui.close();
                 }
             });
         });
+    }
+
+    fn about_ui(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let icon = self.about_icon.get_or_insert_with(|| load_icon(ctx, "application", APP_ICON));
+        let mut close = false;
+        egui::Window::new("About")
+            .open(&mut self.about_open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    match icon {
+                        Ok(icon) => { ui.image((icon.id(), egui::vec2(48.0, 48.0))); }
+                        Err(error) => { ui.colored_label(Color32::LIGHT_RED, error.as_str()); }
+                    }
+                    ui.heading("RustEd");
+                });
+                ui.label("Version 1.0.0");
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+            });
+        if close {
+            self.about_open = false;
+        }
+    }
+
+    fn view_toolbar(&mut self, ui: &mut egui::Ui) {
+        let icons = self.toolbar_icons.get_or_insert_with(|| ToolbarIcons::load(ui.ctx()));
+        let icons = match icons {
+            Ok(icons) => icons,
+            Err(error) => {
+                ui.colored_label(Color32::LIGHT_RED, error.as_str());
+                return;
+            }
+        };
+        let mut toggle_tail = false;
+        let mut toggle_filter = false;
+        let tab = &mut self.tabs[self.active];
+        ui.horizontal(|ui| {
+            if ui.add_enabled(self.browser.is_none(), toolbar_button(&icons.find, "Find", tab.filter_open))
+                .on_hover_text("Filter / Find (F4 / Ctrl+F)")
+                .clicked()
+            {
+                toggle_filter = true;
+            }
+            if ui.add(toolbar_button(&icons.wrap, "Word wrap", tab.word_wrap))
+                .on_hover_text("Toggle word wrap (Ctrl+W)")
+                .clicked()
+            {
+                tab.word_wrap = !tab.word_wrap;
+            }
+            if ui.add(toolbar_button(&icons.hidden, "Hidden characters", tab.hidden_chars))
+                .on_hover_text("Toggle hidden characters (Ctrl+E)")
+                .clicked()
+            {
+                tab.hidden_chars = !tab.hidden_chars;
+            }
+            if ui.add(toolbar_button(&icons.tail, "Tail", tab.tail))
+                .on_hover_text("Toggle file tailing (Ctrl+T)")
+                .clicked()
+            {
+                toggle_tail = true;
+            }
+        });
+        if toggle_filter {
+            self.toggle_filter();
+        }
+        if toggle_tail {
+            self.toggle_tail();
+        }
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -920,6 +1180,52 @@ impl App {
         let mut scroll_end = std::mem::take(&mut tab.scroll_to_end);
         #[allow(deprecated)]
         let id = egui::Id::new(("editor", tab.id));
+        if self.pending_edit.as_ref().is_some_and(|pending| pending.tab_id != tab.id) {
+            self.pending_edit = None;
+        }
+        if self.pending_edit.as_ref().is_some_and(|pending| pending.ready) {
+            let pending = self.pending_edit.take().unwrap();
+            if let Some(range) = pending.selection {
+                if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
+                    state.cursor.set_char_range(Some(range));
+                    state.store(ui.ctx(), id);
+                }
+            }
+            ui.memory_mut(|memory| memory.request_focus(id));
+            match pending.action {
+                EditAction::Paste => ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+                EditAction::Copy => ui.input_mut(|input| input.events.push(egui::Event::Copy)),
+                EditAction::Cut => ui.input_mut(|input| input.events.push(egui::Event::Cut)),
+                EditAction::Undo | EditAction::Redo => {
+                    let key = if matches!(pending.action, EditAction::Undo) { Key::Z } else { Key::Y };
+                    ui.input_mut(|input| input.events.push(egui::Event::Key {
+                        key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND,
+                    }));
+                }
+            }
+        }
+        if ui.memory(|memory| memory.has_focus(id)) && !tab.tail {
+            let redo_z = ui.input_mut(|input| input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
+            let redo_y = ui.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::Y));
+            let undo = ui.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::Z));
+            if undo || redo_y || redo_z {
+                let redo = redo_y || redo_z;
+                let steps = egui::text_edit::TextEditState::load(ui.ctx(), id)
+                    .map(|state| history_steps(&state, &tab.text, redo))
+                    .unwrap_or(0);
+                ui.input_mut(|input| {
+                    for _ in 0..steps {
+                        input.events.push(egui::Event::Key {
+                            key: if redo { Key::Y } else { Key::Z },
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Modifiers::COMMAND,
+                        });
+                    }
+                });
+            }
+        }
         let total = tab.text.bytes().filter(|&b| b == b'\n').count() + 1;
         let gutter_digits = total.to_string().len().max(3);
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
@@ -969,8 +1275,11 @@ impl App {
                 let (pressed, down, alt, pos) = ui.input(|i| {
                     (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers.alt, i.pointer.latest_pos())
                 });
+                let over_editor = pos.is_some_and(|p| {
+                    area.contains(p) && ui.ctx().layer_id_at(p) == Some(ui.layer_id())
+                });
                 let starting_column = !tailing && !wrap && pressed && alt
-                    && pos.is_some_and(|p| area.contains(p));
+                    && over_editor;
                 let column_drag = starting_column || tab.col_drag;
                 if column_drag {
                     if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
@@ -1034,7 +1343,7 @@ impl App {
                         (line, x.max(0.0))
                     };
                     if let Some(p) = pos {
-                        if pressed && area.contains(p) {
+                        if pressed && over_editor {
                             if alt {
                                 let lc = to_lc(p);
                                 tab.col_sel = Some(ColSel { anchor: lc, head: lc });
@@ -1188,6 +1497,18 @@ impl App {
                 }
             });
         self.status = status;
+        if ui.memory(|memory| memory.has_focus(id)) {
+            self.editor_selection = egui::text_edit::TextEditState::load(ui.ctx(), id)
+                .and_then(|state| state.cursor.char_range())
+                .map(|range| (tab.id, range));
+        }
+        if let Some(pending) = &mut self.pending_edit {
+            if pending.tab_id == tab.id && !pending.ready {
+                pending.ready = true;
+                ui.memory_mut(|memory| memory.request_focus(id));
+                ui.ctx().request_repaint();
+            }
+        }
     }
 }
 
@@ -1226,6 +1547,7 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
             self.save();
         }
+        self.view_shortcuts(ctx);
         if ctx.input_mut(|i| {
             i.consume_key(Modifiers::NONE, Key::F5) | i.consume_key(Modifiers::COMMAND, Key::R)
         }) {
@@ -1276,6 +1598,7 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("menu").show(root, |ui| self.menu_bar(ui));
         egui::Panel::top("tabs").show(root, |ui| self.tab_bar(ui));
+        egui::Panel::top("view_toolbar").show(root, |ui| self.view_toolbar(ui));
         egui::Panel::bottom("status").show(root, |ui| {
             ui.horizontal(|ui| {
                 let (total, l, c) = self.status;
@@ -1299,6 +1622,7 @@ impl eframe::App for App {
                 self.editor_ui(ui);
             }
         });
+        self.about_ui(root.ctx());
     }
 }
 
@@ -1338,7 +1662,8 @@ fn save_window(w: &WindowState) {
 
 fn main() -> eframe::Result {
     let file = std::env::args_os().nth(1).map(PathBuf::from);
-    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("RustEd");
+    let icon = eframe::icon_data::from_png_bytes(APP_ICON).expect("Cannot load application icon");
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("RustEd").with_icon(icon);
     let mut centered = true;
     if let Some(w) = load_window() {
         viewport = viewport.with_inner_size(w.size).with_maximized(w.maximized);
@@ -1371,6 +1696,14 @@ mod tests {
             message: None,
             focus_editor: true,
             filter_history: Vec::new(),
+            toolbar_icons: None,
+            about_open: false,
+            about_icon: None,
+            editor_selection: None,
+            pending_edit: None,
+            edit_menu_open: false,
+            clipboard_status: Ok(false),
+            clipboard_test_status: Some(Ok(true)),
             window: WindowState {
                 pos: None,
                 size: egui::vec2(800.0, 600.0),
@@ -1402,6 +1735,384 @@ mod tests {
             }),
             _ => false,
         })
+    }
+
+    fn toolbar_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            app.menu_bar(ui);
+            app.view_toolbar(ui);
+            ui.separator();
+            app.editor_ui(ui);
+            app.about_ui(ui.ctx());
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    fn find_label(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                Some(text.pos + text.galley.rect.center().to_vec2())
+            }
+            _ => None,
+        }).unwrap_or_else(|| panic!("missing {label}: {:?}", output.shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
+            _ => None,
+        }).collect::<Vec<_>>()))
+    }
+
+    fn open_edit(ctx: &egui::Context, app: &mut App) -> egui::FullOutput {
+        let output = toolbar_frame(ctx, app, vec![]);
+        let pos = find_label(&output, "Edit");
+        let button = |pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+        };
+        toolbar_frame(ctx, app, vec![egui::Event::PointerMoved(pos), button(true)]);
+        toolbar_frame(ctx, app, vec![button(false)]);
+        toolbar_frame(ctx, app, vec![])
+    }
+
+    fn click_edit(ctx: &egui::Context, app: &mut App, label: &str) -> egui::FullOutput {
+        let output = open_edit(ctx, app);
+        let pos = find_label(&output, label);
+        let button = |pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+        };
+        toolbar_frame(ctx, app, vec![egui::Event::PointerMoved(pos), button(true)]);
+        toolbar_frame(ctx, app, vec![button(false)]);
+        toolbar_frame(ctx, app, vec![])
+    }
+
+    fn click_at(ctx: &egui::Context, app: &mut App, pos: egui::Pos2) -> egui::FullOutput {
+        let button = |pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+        };
+        toolbar_frame(ctx, app, vec![egui::Event::PointerMoved(pos), button(true)]);
+        toolbar_frame(ctx, app, vec![button(false)]);
+        toolbar_frame(ctx, app, vec![])
+    }
+
+    #[test]
+    fn about_program_opens_and_closes_dialog() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        assert!(find_label(&output, "File").x < find_label(&output, "About").x);
+        assert!(find_label(&output, "About").x < find_label(&output, "Edit").x);
+        let output = click_at(&ctx, &mut app, find_label(&output, "About"));
+        let output = click_at(&ctx, &mut app, find_label(&output, "Program"));
+        assert!(app.about_open);
+        find_label(&output, "rusted");
+        find_label(&output, "Version 1.0.0");
+        assert!(app.about_icon.as_ref().is_some_and(Result::is_ok));
+        click_at(&ctx, &mut app, find_label(&output, "Close"));
+        assert!(!app.about_open);
+    }
+
+    #[test]
+    fn find_toolbar_toggles_active_tab_filter() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.new_tab(None, "second".into(), false, 0);
+        app.active = 0;
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        let find = find_label(&output, "Find");
+        assert!(find.x < find_label(&output, "Word wrap").x);
+        let output = click_at(&ctx, &mut app, find);
+        assert!(app.tabs[0].filter_open);
+        assert!(app.tabs[0].focus_filter);
+        assert!(!app.tabs[1].filter_open);
+        click_at(&ctx, &mut app, find_label(&output, "Find"));
+        assert!(!app.tabs[0].filter_open);
+        #[allow(deprecated)]
+        let id = egui::Id::new(("editor", app.tabs[0].id));
+        assert!(ctx.memory(|memory| memory.has_focus(id)));
+        app.browser = Some(Browser {
+            mode: BrowserMode::Open,
+            dir: PathBuf::new(),
+            entries: Vec::new(),
+            name: String::new(),
+            error: None,
+            focus_name: false,
+        });
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        click_at(&ctx, &mut app, find_label(&output, "Find"));
+        assert!(!app.tabs[0].filter_open);
+    }
+
+    #[test]
+    fn edit_menu_clipboard_actions_use_editor_selection() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.rows.len() == 4 => Some(text),
+            _ => None,
+        }).unwrap();
+        let row = &text.galley.rows[0];
+        let start = text.pos + egui::vec2(row.pos.x + row.glyphs[1].pos.x, row.rect().center().y);
+        let end = text.pos + egui::vec2(row.pos.x + row.glyphs[4].pos.x, row.rect().center().y);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+        };
+        toolbar_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(start), button(start, true)]);
+        toolbar_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)]);
+        toolbar_frame(&ctx, &mut app, vec![button(end, false)]);
+        #[allow(deprecated)]
+        let id = egui::Id::new(("editor", 0_u64));
+        let range = egui::text_edit::TextEditState::load(&ctx, id).unwrap().cursor.char_range().unwrap();
+        assert!(!range.is_empty(), "selection missing after drag: {range:?}");
+        let output = click_edit(&ctx, &mut app, "Copy");
+        assert!(output.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "bcd")), "{:?}", output.platform_output.commands);
+        let output = click_edit(&ctx, &mut app, "Cut");
+        assert!(output.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "bcd")));
+        assert!(app.tabs[0].text.starts_with("aefghij"));
+        let output = click_edit(&ctx, &mut app, "Paste");
+        assert!(output.viewport_output.values().any(|v| v.commands.iter().any(|c| matches!(c, egui::ViewportCommand::RequestPaste))));
+        toolbar_frame(&ctx, &mut app, vec![egui::Event::Paste("XYZ".into())]);
+        assert!(app.tabs[0].text.starts_with("aXYZefghij"));
+    }
+
+    #[test]
+    fn edit_menu_clipboard_respects_rectangular_selection_and_tail() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        let galley = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.rows.len() == 4 => Some(text.galley.clone()),
+            _ => None,
+        }).unwrap();
+        let row = &galley.rows[0];
+        app.tabs[0].col_sel = Some(ColSel {
+            anchor: (0, row.glyphs[1].pos.x),
+            head: (1, row.glyphs[4].pos.x),
+        });
+        let output = click_edit(&ctx, &mut app, "Copy");
+        assert!(output.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "bcd\nbcd")));
+        let output = click_edit(&ctx, &mut app, "Cut");
+        assert!(output.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "bcd\nbcd")));
+        assert!(app.tabs[0].text.starts_with("aefghij\naefghij"));
+        app.tabs[0].tail = true;
+        let text = app.tabs[0].text.clone();
+        click_edit(&ctx, &mut app, "Cut");
+        let output = click_edit(&ctx, &mut app, "Paste");
+        assert_eq!(app.tabs[0].text, text);
+        assert!(!output.viewport_output.values().any(|v| v.commands.iter().any(|c| matches!(c, egui::ViewportCommand::RequestPaste))));
+        assert!(app.tabs[0].tail);
+    }
+
+    #[test]
+    fn edit_menu_undo_and_redo() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text = "original".into();
+        toolbar_frame(&ctx, &mut app, vec![]);
+        toolbar_frame(&ctx, &mut app, vec![egui::Event::Text("X".into())]);
+        let edited = app.tabs[0].text.clone();
+        assert_ne!(edited, "original");
+        click_edit(&ctx, &mut app, "Undo");
+        assert_eq!(app.tabs[0].text, "original");
+        click_edit(&ctx, &mut app, "Redo");
+        assert_eq!(app.tabs[0].text, edited);
+    }
+
+    fn key_event(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn keyboard_undo_ignores_cursor_only_history_and_preserves_position() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        frame(&ctx, &mut app, vec![], false);
+        #[allow(deprecated)]
+        let id = egui::Id::new(("editor", app.tabs[0].id));
+        let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+        let first = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+        let last = egui::text::CCursorRange::one(egui::text::CCursor::new(app.tabs[0].text.len()));
+        let mut undoer = egui::util::undoer::Undoer::default();
+        undoer.add_undo(&(last, app.tabs[0].text.clone()));
+        state.set_undoer(undoer);
+        state.cursor.set_char_range(Some(first));
+        state.store(&ctx, id);
+        let before = frame(&ctx, &mut app, vec![], false);
+        assert!(ctx.memory(|m| m.has_focus(id)), "editor lacks focus");
+        assert_eq!(egui::text_edit::TextEditState::load(&ctx, id).unwrap().cursor.char_range(), Some(first), "before undo");
+        let text_y = |output: &egui::FullOutput| output.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.rows.len() == 100 => Some(t.pos.y),
+            _ => None,
+        }).unwrap();
+        let after = frame(&ctx, &mut app, vec![key_event(Key::Z, Modifiers::COMMAND)], false);
+        let state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+        assert_eq!(state.cursor.char_range(), Some(first));
+        assert_eq!(text_y(&before), text_y(&after));
+        assert_eq!(history_steps(&state, &app.tabs[0].text, false), 0);
+    }
+
+    #[test]
+    fn keyboard_undo_and_shift_redo_skip_cursor_only_history() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text = "changed".into();
+        frame(&ctx, &mut app, vec![], false);
+        #[allow(deprecated)]
+        let id = egui::Id::new(("editor", app.tabs[0].id));
+        let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+        let at = |i| egui::text::CCursorRange::one(egui::text::CCursor::new(i));
+        let mut undoer = egui::util::undoer::Undoer::default();
+        undoer.add_undo(&(at(0), "original".into()));
+        undoer.add_undo(&(at(1), "changed".into()));
+        undoer.add_undo(&(at(2), "changed".into()));
+        state.set_undoer(undoer);
+        state.cursor.set_char_range(Some(at(2)));
+        assert_eq!(history_steps(&state, "changed", false), 2);
+        state.store(&ctx, id);
+        assert!(ctx.memory(|m| m.has_focus(id)), "editor lacks focus");
+        frame(&ctx, &mut app, vec![key_event(Key::Z, Modifiers::COMMAND)], false);
+        assert_eq!(app.tabs[0].text, "original");
+        frame(&ctx, &mut app, vec![key_event(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT)], false);
+        assert_eq!(app.tabs[0].text, "changed");
+        frame(&ctx, &mut app, vec![key_event(Key::Z, Modifiers::COMMAND)], false);
+        assert_eq!(app.tabs[0].text, "original");
+        frame(&ctx, &mut app, vec![key_event(Key::Y, Modifiers::COMMAND)], false);
+        assert_eq!(app.tabs[0].text, "changed");
+    }
+
+    #[test]
+    fn edit_menu_disables_unavailable_actions_and_reports_clipboard_errors() {
+        for (status, label) in [
+            (Ok(false), "Paste"),
+            (Err("test clipboard error".to_owned()), "Paste"),
+            (Ok(true), "Undo"),
+            (Ok(true), "Redo"),
+            (Ok(true), "Cut"),
+            (Ok(true), "Copy"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = test_app();
+            app.clipboard_test_status = Some(status.clone());
+            let before = app.tabs[0].text.clone();
+            let output = click_edit(&ctx, &mut app, label);
+            assert_eq!(app.tabs[0].text, before, "{label}");
+            assert!(app.pending_edit.is_none(), "{label}");
+            assert!(!output.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_))), "{label}");
+            assert!(!output.viewport_output.values().any(|v| v.commands.iter().any(|c| matches!(c, egui::ViewportCommand::RequestPaste))), "{label}");
+            if status.is_err() {
+                let output = open_edit(&ctx, &mut app);
+                assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text.contains("test clipboard error"))));
+            }
+        }
+    }
+
+    #[test]
+    fn view_shortcuts_toggle_only_the_active_tab() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.new_tab(None, "second".into(), false, 0);
+        app.active = 0;
+        for key in [Key::W, Key::E, Key::T] {
+            let input = egui::RawInput {
+                events: vec![key_event(key, Modifiers::COMMAND)],
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |_| app.view_shortcuts(&ctx));
+            output.textures_delta.clear();
+        }
+        assert!(app.tabs[0].word_wrap && app.tabs[0].hidden_chars && app.tabs[0].tail);
+        assert!(!app.tabs[1].word_wrap && !app.tabs[1].hidden_chars && !app.tabs[1].tail);
+        let input = egui::RawInput { events: vec![key_event(Key::T, Modifiers::COMMAND)], ..Default::default() };
+        let mut output = ctx.run_ui(input, |_| app.view_shortcuts(&ctx));
+        output.textures_delta.clear();
+        assert!(!app.tabs[0].tail);
+    }
+
+    #[test]
+    fn view_shortcuts_respect_browser_and_failed_tail_reload() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.browser = Some(Browser {
+            mode: BrowserMode::Open,
+            dir: PathBuf::new(),
+            entries: Vec::new(),
+            name: String::new(),
+            error: None,
+            focus_name: false,
+        });
+        for key in [Key::W, Key::E, Key::T] {
+            let input = egui::RawInput { events: vec![key_event(key, Modifiers::COMMAND)], ..Default::default() };
+            let mut output = ctx.run_ui(input, |_| app.view_shortcuts(&ctx));
+            output.textures_delta.clear();
+        }
+        assert!(!app.tabs[0].word_wrap && !app.tabs[0].hidden_chars && !app.tabs[0].tail);
+        app.browser = None;
+        app.tabs[0].path = Some(std::env::temp_dir().join(format!("rusted-missing-{}", std::process::id())).join("file"));
+        let input = egui::RawInput { events: vec![key_event(Key::T, Modifiers::COMMAND)], ..Default::default() };
+        let mut output = ctx.run_ui(input, |_| app.view_shortcuts(&ctx));
+        output.textures_delta.clear();
+        assert!(!app.tabs[0].tail);
+        assert!(app.message.as_deref().is_some_and(|message| message.starts_with("Cannot reload ")));
+    }
+
+    #[test]
+    fn toolbar_controls_current_tab_and_tail_reloads() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let path = std::env::temp_dir().join(format!(
+            "rusted-toolbar-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, "disk content").unwrap();
+        app.tabs[0].path = Some(path.clone());
+        app.tabs[0].text = "unsaved content".into();
+        app.tabs[0].dirty = true;
+        app.new_tab(None, "second tab".into(), false, 0);
+        app.active = 0;
+
+        let run = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.view_toolbar(ui));
+            output.textures_delta.clear();
+            output
+        };
+        for label in ["Word wrap", "Hidden characters", "Tail"] {
+            let output = run(&mut app, vec![]);
+            let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains(label) => {
+                    Some(text.pos + text.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            }).unwrap();
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            run(&mut app, vec![egui::Event::PointerMoved(pos), button(true)]);
+            run(&mut app, vec![button(false)]);
+        }
+        assert!(app.tabs[0].word_wrap);
+        assert!(app.tabs[0].hidden_chars);
+        assert!(app.tabs[0].tail);
+        assert_eq!(app.tabs[0].text, "disk content");
+        assert!(!app.tabs[0].dirty);
+        assert!(app.tabs[0].scroll_to_end);
+        assert!(!app.tabs[1].word_wrap && !app.tabs[1].hidden_chars && !app.tabs[1].tail);
+        app.active = 1;
+        run(&mut app, vec![]);
+        assert!(!app.tabs[1].word_wrap && !app.tabs[1].hidden_chars && !app.tabs[1].tail);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
