@@ -84,4 +84,4 @@ TODO
 - Syntax highlighting
 - Add link to github on about dialog
 - Row highlighting on filtered matches with custom color
--
+- add a "minimap" feature the same as the one in vscode.  it's a vertical bar that shows the content of the entire file in 
