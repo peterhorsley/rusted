@@ -69,6 +69,11 @@ Use Ctrl+Tab and Ctrl+Shift+Tab to cycle through open tabs.
 The Edit menu provides undo, redo, cut, copy and paste. The About > Program
 menu shows the application version. The toolbar beneath the file tabs opens
 Filter / Find and controls word wrap, hidden characters and tailing for the current tab.
+File > Find / Replace (F4 or Ctrl+F) also offers Replace all, which uses the
+current Find text and case-sensitivity setting. An empty replacement deletes
+matches; an empty Find text does nothing. Replacements can be undone and are
+disabled while tailing. Find and Replace each offer a dropdown of their last
+10 nonempty values, shared across tabs for the current session.
 The Find bar offers five background colors for matching lines, defaulting to Dark Green. Search replaces
 the previous highlights; changing the color updates the current highlights.
 Matching text is white. Editing a highlighted line clears its highlight until
@@ -78,7 +83,8 @@ Double-click a search result to jump to its line, shown in yellow text.
 Use File > Go to line (Ctrl+G) to jump to a line and mark its line number white.
 Use Ctrl+W, Ctrl+E and Ctrl+T respectively to toggle them.
 Enabling tail reloads the file and discards any unsaved edits; editing actions
-are disabled while tailing. Toolbar icons are embedded in the executable.
+are disabled while tailing. Tail scrolling moves to the bottom-left of the editor.
+Toolbar icons are embedded in the executable.
 For `.json` files, the toolbar also offers Format JSON, which formats valid JSON
 with two-space indentation. Invalid JSON is left unchanged and an error is shown
 in the status bar. Formatting is undoable and is disabled while tailing.
@@ -91,5 +97,4 @@ TODO
 - Syntax highlighting
 - Add link to github on about dialog
 - add a "minimap" feature the same as the one in vscode.  it's a vertical bar that shows the content of the entire file in 
-- - go to line Ctrl+G
-- replace text in file
+- alt selection color too dark

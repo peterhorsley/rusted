@@ -11,6 +11,36 @@ const APP_ICON: &[u8] = include_bytes!("assets/app.png");
 const MAX_FILTER_HISTORY: usize = 10;
 const TAIL_POLL: Duration = Duration::from_millis(400);
 
+fn remember_history(history: &mut Vec<String>, value: &str) {
+    if !value.is_empty() {
+        history.retain(|entry| entry != value);
+        history.insert(0, value.to_owned());
+        history.truncate(MAX_FILTER_HISTORY);
+    }
+}
+
+fn history_menu(ui: &mut egui::Ui, history: &[String], tooltip: &str) -> Option<String> {
+    let mut selected = None;
+    ui.add_enabled_ui(!history.is_empty(), |ui| {
+        let arrow = egui::Atom::paint(egui::vec2(12.0, 12.0), |ui, args| {
+            ui.painter().add(egui::Shape::rotated_triangle(
+                egui::Rect::from_center_size(args.rect.center(), egui::vec2(8.0, 6.0)),
+                0.0,
+                args.fallback_text_color,
+            ));
+        });
+        ui.menu_button(arrow, |ui| {
+            for entry in history {
+                if ui.button(entry).clicked() {
+                    selected = Some(entry.clone());
+                    ui.close();
+                }
+            }
+        }).response.on_hover_text(tooltip);
+    });
+    selected
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum HighlightColor {
     DarkGray,
@@ -67,6 +97,29 @@ fn match_ranges(line: &str, pattern: &str, case: bool) -> Vec<std::ops::Range<us
         let last = boundaries.get(boundaries.partition_point(|(_, to, _, _)| *to < end))?;
         Some(first.2..last.3)
     }).collect()
+}
+
+fn replace_matches(text: &str, pattern: &str, replacement: &str, case: bool) -> Option<String> {
+    if pattern.is_empty() {
+        return None;
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut changed = false;
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let mut start = 0;
+        for range in match_ranges(content, pattern, case) {
+            if range.start < start {
+                continue;
+            }
+            output.push_str(&content[start..range.start]);
+            output.push_str(replacement);
+            changed |= &content[range.clone()] != replacement;
+            start = range.end;
+        }
+        output.push_str(&line[start..]);
+    }
+    changed.then_some(output)
 }
 
 fn search_layout(text: &str, highlights: &SearchHighlights, selected_line: Option<usize>, hidden: bool, font: &FontId, width: f32) -> egui::text::LayoutJob {
@@ -347,6 +400,7 @@ struct Tab {
     scroll_to_goto: Option<usize>,
     filter_open: bool,
     filter_text: String,
+    replace_text: String,
     case_sensitive: bool,
     applied: (String, bool),
     focus_filter: bool,
@@ -596,6 +650,7 @@ struct App {
     message: Option<String>,
     focus_editor: bool,
     filter_history: Vec<String>,
+    replace_history: Vec<String>,
     toolbar_icons: Option<Result<ToolbarIcons, String>>,
     about_open: bool,
     about_icon: Option<Result<egui::TextureHandle, String>>,
@@ -870,6 +925,7 @@ impl App {
             message: None,
             focus_editor: true,
             filter_history: Vec::new(),
+            replace_history: Vec::new(),
             toolbar_icons: None,
             about_open: false,
             about_icon: None,
@@ -917,6 +973,7 @@ impl App {
             scroll_to_goto: None,
             filter_open: false,
             filter_text: String::new(),
+            replace_text: String::new(),
             case_sensitive: false,
             applied: (String::new(), false),
             focus_filter: false,
@@ -1077,37 +1134,56 @@ impl App {
         }
     }
 
-    fn format_current_json(&mut self, ctx: &egui::Context) {
+    fn replace_tab_text(&mut self, ctx: &egui::Context, text: String) {
         let tab = &mut self.tabs[self.active];
+        if text == tab.text {
+            return;
+        }
+        #[allow(deprecated)]
+        let id = egui::Id::new(("editor", tab.id));
+        let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+        let old_range = state.cursor.char_range()
+            .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+        let cursor = usize::from(old_range.primary.index).min(text.chars().count());
+        let new_range = egui::text::CCursorRange::one(egui::text::CCursor::new(cursor));
+        let mut undoer = state.undoer();
+        undoer.add_undo(&(old_range, tab.text.clone()));
+        undoer.feed_state(ctx.input(|input| input.time), &(new_range, text.clone()));
+        undoer.add_undo(&(new_range, text.clone()));
+        state.set_undoer(undoer);
+        state.cursor.set_char_range(Some(new_range));
+        state.store(ctx, id);
+        tab.text = text;
+        tab.search_highlights.edited(&tab.text);
+        tab.dirty = tab.text != tab.saved_text;
+        tab.highlight = None;
+        tab.col_sel = None;
+        tab.col_drag = false;
+        tab.filter.applied = None;
+        self.editor_selection = Some((tab.id, new_range));
+        self.focus_editor = true;
+    }
+
+    fn replace_all(&mut self, ctx: &egui::Context) {
+        let tab = &self.tabs[self.active];
+        if tab.tail {
+            return;
+        }
+        if !tab.filter_text.is_empty() {
+            remember_history(&mut self.replace_history, &tab.replace_text);
+        }
+        if let Some(text) = replace_matches(&tab.text, &tab.filter_text, &tab.replace_text, tab.case_sensitive) {
+            self.replace_tab_text(ctx, text);
+            self.update_filter(false);
+        }
+    }
+
+    fn format_current_json(&mut self, ctx: &egui::Context) {
+        let tab = &self.tabs[self.active];
         match format_json(&tab.text) {
             Ok(formatted) => {
                 self.message = None;
-                if formatted == tab.text {
-                    return;
-                }
-                #[allow(deprecated)]
-                let id = egui::Id::new(("editor", tab.id));
-                let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
-                let old_range = state.cursor.char_range()
-                    .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
-                let cursor = usize::from(old_range.primary.index).min(formatted.chars().count());
-                let new_range = egui::text::CCursorRange::one(egui::text::CCursor::new(cursor));
-                let mut undoer = state.undoer();
-                undoer.add_undo(&(old_range, tab.text.clone()));
-                undoer.feed_state(ctx.input(|input| input.time), &(new_range, formatted.clone()));
-                undoer.add_undo(&(new_range, formatted.clone()));
-                state.set_undoer(undoer);
-                state.cursor.set_char_range(Some(new_range));
-                state.store(ctx, id);
-                tab.text = formatted;
-                tab.search_highlights.edited(&tab.text);
-                tab.dirty = tab.text != tab.saved_text;
-                tab.highlight = None;
-                tab.col_sel = None;
-                tab.col_drag = false;
-                tab.filter.applied = None;
-                self.editor_selection = Some((tab.id, new_range));
-                self.focus_editor = true;
+                self.replace_tab_text(ctx, formatted);
             }
             Err(error) => self.message = Some(format!("Cannot format JSON: {error}")),
         }
@@ -1116,11 +1192,7 @@ impl App {
     fn apply_search(&mut self) {
         let tab = &mut self.tabs[self.active];
         let text = tab.filter_text.clone();
-        if !text.is_empty() {
-            self.filter_history.retain(|h| h != &text);
-            self.filter_history.insert(0, text.clone());
-            self.filter_history.truncate(MAX_FILTER_HISTORY);
-        }
+        remember_history(&mut self.filter_history, &text);
         tab.applied = (text, tab.case_sensitive);
         tab.search_highlights.search(&tab.text, &tab.applied.0, tab.applied.1);
         tab.filter.applied = None;
@@ -1163,35 +1235,35 @@ impl App {
 
     fn filter_ui(&mut self, ui: &mut egui::Ui) {
         let mut search = false;
-        let history = self.filter_history.clone();
+        let mut replace = false;
+        let history = &self.filter_history;
+        let replace_history = &self.replace_history;
         let tab = &mut self.tabs[self.active];
+        let label_font = egui::TextStyle::Body.resolve(ui.style());
+        let label_width = ui.fonts_mut(|fonts| {
+            ["Find:", "Replace:"].iter()
+                .map(|label| fonts.layout_no_wrap((*label).to_owned(), label_font.clone(), Color32::WHITE).size().x)
+                .fold(0.0_f32, f32::max)
+        });
         ui.horizontal(|ui| {
-            ui.label("Find:");
+            let (_, label_rect) = ui.allocate_space(egui::vec2(label_width, 0.0));
             let r = ui.add(TextEdit::singleline(&mut tab.filter_text).desired_width(320.0));
+            let label_rect = egui::Rect::from_min_max(
+                egui::pos2(label_rect.left(), r.rect.top()),
+                egui::pos2(label_rect.right(), r.rect.bottom()),
+            );
+            ui.new_child(egui::UiBuilder::new().max_rect(label_rect).layout(egui::Layout::right_to_left(egui::Align::Center)))
+                .label("Find:");
             if std::mem::take(&mut tab.focus_filter) {
                 r.request_focus();
             }
             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 search = true;
             }
-            ui.add_enabled_ui(!history.is_empty(), |ui| {
-                let arrow = egui::Atom::paint(egui::vec2(12.0, 12.0), |ui, args| {
-                    ui.painter().add(egui::Shape::rotated_triangle(
-                        egui::Rect::from_center_size(args.rect.center(), egui::vec2(8.0, 6.0)),
-                        0.0,
-                        args.fallback_text_color,
-                    ));
-                });
-                ui.menu_button(arrow, |ui| {
-                    for h in history {
-                        if ui.button(&h).clicked() {
-                            tab.filter_text = h;
-                            search = true;
-                            ui.close();
-                        }
-                    }
-                }).response.on_hover_text("Find history");
-            });
+            if let Some(entry) = history_menu(ui, history, "Find history") {
+                tab.filter_text = entry;
+                search = true;
+            }
             if ui.button("Search").clicked() {
                 search = true;
             }
@@ -1221,8 +1293,25 @@ impl App {
                     });
             });
         });
+        ui.horizontal(|ui| {
+            let (_, label_rect) = ui.allocate_space(egui::vec2(label_width, 0.0));
+            let r = ui.add(TextEdit::singleline(&mut tab.replace_text).desired_width(320.0));
+            let label_rect = egui::Rect::from_min_max(
+                egui::pos2(label_rect.left(), r.rect.top()),
+                egui::pos2(label_rect.right(), r.rect.bottom()),
+            );
+            ui.new_child(egui::UiBuilder::new().max_rect(label_rect).layout(egui::Layout::right_to_left(egui::Align::Center)))
+                .label("Replace:");
+            if let Some(entry) = history_menu(ui, replace_history, "Replace history") {
+                tab.replace_text = entry;
+            }
+            replace = ui.add_enabled(!tab.tail, egui::Button::new("Replace all")).clicked();
+        });
         if search {
             self.apply_search();
+        }
+        if replace {
+            self.replace_all(ui.ctx());
         }
         ui.separator();
 
@@ -1309,7 +1398,7 @@ impl App {
                     self.reload();
                     ui.close();
                 }
-                if ui.add(egui::Button::new("Find").shortcut_text("F4 / Ctrl+F")).clicked() {
+                if ui.add(egui::Button::new("Find / Replace").shortcut_text("F4 / Ctrl+F")).clicked() {
                     self.toggle_filter();
                     ui.close();
                 }
@@ -1617,7 +1706,7 @@ impl App {
         let tab = &mut self.tabs[self.active];
         let wrap = tab.word_wrap;
         let hidden = tab.hidden_chars;
-        let mut scroll_end = std::mem::take(&mut tab.scroll_to_end);
+        let scroll_end = std::mem::take(&mut tab.scroll_to_end);
         #[allow(deprecated)]
         let id = egui::Id::new(("editor", tab.id));
         if self.pending_edit.as_ref().is_some_and(|pending| pending.tab_id != tab.id) {
@@ -1695,10 +1784,11 @@ impl App {
         }
         let mut scroll_to = std::mem::take(&mut tab.scroll_to_highlight);
         let mut goto_target = tab.scroll_to_goto.take();
-        egui::ScrollArea::both()
+        let scroll_area = egui::ScrollArea::both()
             .id_salt(("scroll", tab.id))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .auto_shrink([false, false]);
+        let scroll_area = if scroll_end { scroll_area.horizontal_scroll_offset(0.0).animated(false) } else { scroll_area };
+        scroll_area.show(ui, |ui| {
                 let clip = ui.clip_rect();
                 let area = egui::Rect::from_min_max(
                     egui::pos2(clip.left() + gutter_w, clip.top()),
@@ -1806,10 +1896,12 @@ impl App {
                 if scroll_end {
                     let r = out.response.rect;
                     ui.scroll_to_rect(
-                        egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - 1.0), r.max),
-                        Some(egui::Align::BOTTOM),
+                        egui::Rect::from_min_max(
+                            egui::pos2(clip.left(), r.bottom() - 1.0),
+                            egui::pos2(clip.right(), r.bottom()),
+                        ),
+                        None,
                     );
-                    scroll_end = false;
                 }
 
                 let galley = &out.galley;
@@ -2174,6 +2266,7 @@ mod tests {
             message: None,
             focus_editor: true,
             filter_history: Vec::new(),
+            replace_history: Vec::new(),
             toolbar_icons: None,
             about_open: false,
             about_icon: None,
@@ -2325,6 +2418,33 @@ mod tests {
     }
 
     #[test]
+    fn find_and_replace_inputs_are_left_aligned() {
+        for size in [14.0, 24.0] {
+            let ctx = egui::Context::default();
+            ctx.all_styles_mut(|style| {
+                style.text_styles.insert(egui::TextStyle::Body, FontId::proportional(size));
+            });
+            let mut app = test_app();
+            app.tabs[0].filter_text = "find input".into();
+            app.tabs[0].replace_text = "replacement input".into();
+            let output = filter_frame(&ctx, &mut app, vec![]);
+            let text_rect = |label: &str| output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => Some(text.galley.rect.translate(text.pos.to_vec2())),
+                _ => None,
+            }).unwrap();
+            let find = text_rect("find input");
+            let replace = text_rect("replacement input");
+            let find_label = text_rect("Find:");
+            let replace_label = text_rect("Replace:");
+            assert!((find.left() - replace.left()).abs() < 0.1, "{find:?} {replace:?}");
+            assert!((find_label.right() - replace_label.right()).abs() < 0.1, "{find_label:?} {replace_label:?}");
+            assert!((find_label.center().y - find.center().y).abs() < 1.0, "{find_label:?} {find:?}");
+            assert!((replace_label.center().y - replace.center().y).abs() < 1.0, "{replace_label:?} {replace:?}");
+            assert!(find.top() < replace.top());
+        }
+    }
+
+    #[test]
     fn double_click_search_result_preserves_horizontal_scroll() {
         for font_size in [14.0, 30.0] {
             for horizontal in [0.0, 120.0] {
@@ -2446,6 +2566,63 @@ mod tests {
         filter_frame(&ctx, &mut app, vec![button(pos, false)]);
         assert_eq!(app.tabs[0].filter_text, "history entry");
         assert_eq!(app.tabs[0].applied.0, "history entry");
+    }
+
+    #[test]
+    fn replace_history_tracks_recent_values_and_selection_does_not_replace() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].filter_open = true;
+        app.tabs[0].filter_text = "not present".into();
+        for i in 0..12 {
+            app.tabs[0].replace_text = format!("replacement {i}");
+            filter_frame(&ctx, &mut app, vec![]);
+            ctx.run_ui(egui::RawInput::default(), |ui| app.replace_all(ui.ctx())).textures_delta.clear();
+        }
+        assert_eq!(app.replace_history.len(), 10);
+        assert_eq!(app.replace_history[0], "replacement 11");
+        assert_eq!(app.replace_history[9], "replacement 2");
+        app.tabs[0].replace_text = "replacement 5".into();
+        ctx.run_ui(egui::RawInput::default(), |ui| app.replace_all(ui.ctx())).textures_delta.clear();
+        assert_eq!(app.replace_history[0], "replacement 5");
+        assert_eq!(app.replace_history.iter().filter(|s| *s == "replacement 5").count(), 1);
+        app.tabs[0].replace_text.clear();
+        ctx.run_ui(egui::RawInput::default(), |ui| app.replace_all(ui.ctx())).textures_delta.clear();
+        app.tabs[0].replace_text = "ignored".into();
+        app.tabs[0].filter_text.clear();
+        ctx.run_ui(egui::RawInput::default(), |ui| app.replace_all(ui.ctx())).textures_delta.clear();
+        app.tabs[0].filter_text = "not present".into();
+        app.tabs[0].tail = true;
+        ctx.run_ui(egui::RawInput::default(), |ui| app.replace_all(ui.ctx())).textures_delta.clear();
+        assert_eq!(app.replace_history.len(), 10);
+        assert!(!app.replace_history.iter().any(|entry| entry == "ignored"));
+        app.tabs[0].tail = false;
+        app.filter_history.push("find history".into());
+        app.new_tab(None, "replacement 5 not present".into(), false, 0);
+        app.tabs[1].filter_open = true;
+        let before = app.tabs[1].text.clone();
+        let output = filter_frame(&ctx, &mut app, vec![]);
+        let mut arrows: Vec<_> = output.shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Path(path) if path.closed && path.points.len() == 3 => Some(egui::Rect::from_points(&path.points).center()),
+            _ => None,
+        }).collect();
+        arrows.retain(|p| p.x < find_label(&output, "Replace all").x);
+        arrows.sort_by(|a, b| a.y.total_cmp(&b.y));
+        assert_eq!(arrows.len(), 2);
+        assert!((arrows[0].x - arrows[1].x).abs() < 0.1);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        };
+        let pos = arrows[1];
+        filter_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+        filter_frame(&ctx, &mut app, vec![button(pos, false)]);
+        let output = filter_frame(&ctx, &mut app, vec![]);
+        let pos = find_label(&output, "replacement 5");
+        filter_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+        filter_frame(&ctx, &mut app, vec![button(pos, false)]);
+        assert_eq!(app.tabs[1].replace_text, "replacement 5");
+        assert_eq!(app.tabs[1].text, before);
+        assert!(!app.tabs[1].dirty);
     }
 
     #[test]
@@ -2608,6 +2785,85 @@ mod tests {
     }
 
     #[test]
+    fn tail_scrolls_to_bottom_left_when_enabled_and_when_file_grows() {
+        let path = std::env::temp_dir().join(format!(
+            "rusted-tail-scroll-{}-{}.txt", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let long = "abcdefghij".repeat(80);
+        let initial = (0..100).map(|i| format!("line {i} {long}\n")).collect::<String>();
+        std::fs::write(&path, &initial).unwrap();
+        for font_size in [14.0, 30.0] {
+            for horizontal in [0.0, 120.0] {
+                let ctx = egui::Context::default();
+                ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+                let mut app = test_app();
+                app.font_size = font_size;
+                app.tabs[0].path = Some(path.clone());
+                assert!(reload_from_disk(&mut app.tabs[0], &path));
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        egui::ScrollArea::both().id_salt(("scroll", app.tabs[0].id))
+                            .horizontal_scroll_offset(horizontal).show(ui, |ui| ui.set_min_size(egui::vec2(8000.0, 3000.0)));
+                    });
+                });
+                output.textures_delta.clear();
+                let run = |app: &mut App| {
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                        ..Default::default()
+                    };
+                    let mut area = egui::Rect::NOTHING;
+                    let mut output = ctx.run_ui(input, |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            area = ui.clip_rect();
+                            app.editor_ui(ui);
+                        });
+                    });
+                    let text = output.shapes.iter().find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.job.text.starts_with("line 0 ") => Some(t),
+                        _ => None,
+                    }).unwrap();
+                    let final_line = (app.tabs[0].text.bytes().filter(|&b| b == b'\n').count() + 1).to_string();
+                    let gutter = output.shapes.iter().find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.job.text == final_line => Some(t.pos.y),
+                        _ => None,
+                    });
+                    let (x, bottom) = (text.pos.x, text.pos.y + text.galley.rect.bottom());
+                    output.textures_delta.clear();
+                    (x, bottom, area, gutter)
+                };
+                let (before_x, before_bottom, _, _) = run(&mut app);
+                app.toggle_tail();
+                assert!(app.tabs[0].tail);
+                run(&mut app);
+                let (after_x, after_bottom, area, gutter) = run(&mut app);
+                if horizontal == 0.0 {
+                    assert!((after_x - before_x).abs() < 0.1, "{before_x} -> {after_x}");
+                } else {
+                    assert!(after_x > before_x + 100.0, "{before_x} -> {after_x}");
+                }
+                assert!(before_bottom > area.bottom() + 100.0);
+                assert!(gutter.is_some_and(|y| y >= area.bottom() - font_size * 3.0 && y <= area.bottom()), "{after_bottom} {area:?} {gutter:?}");
+                let appended = format!("{initial}last {long}\n");
+                std::fs::write(&path, &appended).unwrap();
+                app.update_filter(true);
+                assert!(app.tabs[0].scroll_to_end);
+                run(&mut app);
+                let (tail_x, tail_bottom, area, gutter) = run(&mut app);
+                assert!((tail_x - after_x).abs() < 0.1);
+                assert!(gutter.is_some_and(|y| y >= area.bottom() - font_size * 3.0 && y <= area.bottom()), "{tail_bottom} {area:?} {gutter:?}");
+                std::fs::write(&path, &initial).unwrap();
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn tail_editor_stays_read_only_when_clicked_and_typed() {
         let ctx = egui::Context::default();
         let mut app = test_app();
@@ -2687,6 +2943,85 @@ mod tests {
         goto_frame(ctx, app, vec![egui::Event::PointerMoved(pos), button(true)]);
         goto_frame(ctx, app, vec![button(false)]);
         goto_frame(ctx, app, vec![])
+    }
+
+    #[test]
+    fn replace_matches_handles_case_unicode_empty_and_nonoverlapping_matches() {
+        assert_eq!(replace_matches("Foo foo\nfOO\n", "foo", "bar", false).as_deref(), Some("bar bar\nbar\n"));
+        assert_eq!(replace_matches("Foo foo", "foo", "", true).as_deref(), Some("Foo "));
+        assert_eq!(replace_matches("aaaa", "aa", "a", true).as_deref(), Some("aa"));
+        assert_eq!(replace_matches("İ İX", "i\u{307}", "z", false).as_deref(), Some("z zX"));
+        assert_eq!(replace_matches("İ", "\u{307}", "z", false).as_deref(), Some("z"));
+        assert_eq!(replace_matches("abc", "", "x", false), None);
+        assert_eq!(replace_matches("abc", "x", "y", false), None);
+        assert_eq!(replace_matches("abc", "a", "a", true), None);
+    }
+
+    #[test]
+    fn replace_all_ui_updates_active_tab_results_and_supports_undo_redo() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs.clear();
+        app.new_tab(Some(PathBuf::from("test.txt")), "foo FOO\nfoo\nother".into(), false, 0);
+        app.new_tab(None, "foo other tab".into(), false, 0);
+        app.active = 0;
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        let output = goto_click(&ctx, &mut app, find_label(&output, "File"));
+        let output = goto_click(&ctx, &mut app, find_label(&output, "Find / Replace"));
+        assert!(app.tabs[0].filter_open);
+        assert!(find_label(&output, "Replace:").y > find_label(&output, "Find:").y);
+        app.tabs[0].filter_text = "foo".into();
+        app.tabs[0].replace_text = "bar".into();
+        app.apply_search();
+        assert_eq!(app.tabs[0].filter.results.len(), 2);
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        goto_click(&ctx, &mut app, find_label(&output, "Replace all"));
+        assert_eq!(app.tabs[0].text, "bar bar\nbar\nother");
+        assert_eq!(app.tabs[1].text, "foo other tab");
+        assert!(app.tabs[0].dirty);
+        assert!(app.tabs[0].filter.results.is_empty());
+        assert!(app.tabs[0].search_highlights.lines.iter().all(Vec::is_empty));
+        goto_frame(&ctx, &mut app, vec![key_event(Key::Z, Modifiers::COMMAND)]);
+        assert_eq!(app.tabs[0].text, "foo FOO\nfoo\nother");
+        assert!(!app.tabs[0].dirty);
+        app.update_filter(false);
+        assert_eq!(app.tabs[0].filter.results.len(), 2);
+        goto_frame(&ctx, &mut app, vec![key_event(Key::Y, Modifiers::COMMAND)]);
+        assert_eq!(app.tabs[0].text, "bar bar\nbar\nother");
+    }
+
+    #[test]
+    fn replace_all_respects_tail_noops_case_and_per_tab_input() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text = "Foo foo".into();
+        app.tabs[0].saved_text = app.tabs[0].text.clone();
+        app.tabs[0].filter_open = true;
+        app.tabs[0].filter_text = "foo".into();
+        app.tabs[0].replace_text = String::new();
+        app.tabs[0].case_sensitive = true;
+        app.tabs[0].tail = true;
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        goto_click(&ctx, &mut app, find_label(&output, "Replace all"));
+        assert_eq!(app.tabs[0].text, "Foo foo");
+        assert!(app.tabs[0].tail);
+        app.tabs[0].tail = false;
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        goto_click(&ctx, &mut app, find_label(&output, "Replace all"));
+        assert_eq!(app.tabs[0].text, "Foo ");
+        goto_frame(&ctx, &mut app, vec![key_event(Key::Z, Modifiers::COMMAND)]);
+        assert_eq!(app.tabs[0].text, "Foo foo");
+        app.tabs[0].filter_text.clear();
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        goto_click(&ctx, &mut app, find_label(&output, "Replace all"));
+        app.focus_editor = true;
+        goto_frame(&ctx, &mut app, vec![]);
+        goto_frame(&ctx, &mut app, vec![key_event(Key::Y, Modifiers::COMMAND)]);
+        assert_eq!(app.tabs[0].text, "Foo ");
+        app.tabs[0].replace_text = "per tab".into();
+        app.new_tab(None, "foo".into(), false, 0);
+        assert_eq!(app.tabs[1].replace_text, "");
+        assert_eq!(app.tabs[0].replace_text, "per tab");
     }
 
     #[test]
