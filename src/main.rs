@@ -11,6 +11,145 @@ const APP_ICON: &[u8] = include_bytes!("assets/app.png");
 const MAX_FILTER_HISTORY: usize = 10;
 const TAIL_POLL: Duration = Duration::from_millis(400);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum HighlightColor {
+    #[default]
+    DarkGray,
+    DarkRed,
+    DarkGreen,
+    DarkBlue,
+    DarkPurple,
+}
+
+impl HighlightColor {
+    const ALL: [Self; 5] = [Self::DarkGray, Self::DarkRed, Self::DarkGreen, Self::DarkBlue, Self::DarkPurple];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::DarkGray => "Dark Gray",
+            Self::DarkRed => "Dark Red",
+            Self::DarkGreen => "Dark Green",
+            Self::DarkBlue => "Dark Blue",
+            Self::DarkPurple => "Dark Purple",
+        }
+    }
+
+    fn color(self) -> Color32 {
+        match self {
+            Self::DarkGray => Color32::from_rgb(27, 27, 27),
+            Self::DarkRed => Color32::from_rgb(85, 30, 30),
+            Self::DarkGreen => Color32::from_rgb(25, 70, 40),
+            Self::DarkBlue => Color32::from_rgb(25, 45, 80),
+            Self::DarkPurple => Color32::from_rgb(65, 35, 75),
+        }
+    }
+}
+
+fn match_ranges(line: &str, pattern: &str, case: bool) -> Vec<std::ops::Range<usize>> {
+    if pattern.is_empty() {
+        return Vec::new();
+    }
+    if case {
+        return line.match_indices(pattern).map(|(start, s)| start..start + s.len()).collect();
+    }
+    let lower = line.to_lowercase();
+    let needle = pattern.to_lowercase();
+    let mut boundaries = Vec::new();
+    let mut offset = 0;
+    for (index, ch) in line.char_indices() {
+        let next = offset + ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+        boundaries.push((offset, next, index, index + ch.len_utf8()));
+        offset = next;
+    }
+    lower.match_indices(&needle).filter_map(|(start, s)| {
+        let end = start + s.len();
+        let first = boundaries.get(boundaries.partition_point(|(_, to, _, _)| *to <= start))?;
+        let last = boundaries.get(boundaries.partition_point(|(_, to, _, _)| *to < end))?;
+        Some(first.2..last.3)
+    }).collect()
+}
+
+fn search_layout(text: &str, highlights: &SearchHighlights, hidden: bool, font: &FontId, width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = width;
+    let append = |job: &mut egui::text::LayoutJob, s: &str, color| {
+        let shown = if hidden { s.replace(' ', "·") } else { s.to_owned() };
+        job.append(&shown, 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
+    };
+    if !highlights.active || text != highlights.snapshot {
+        append(&mut job, text, Color32::from_gray(212));
+        return job;
+    }
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let mut start = 0;
+        if let Some(ranges) = highlights.lines.get(i) {
+            for range in ranges {
+                if range.start < start {
+                    continue;
+                }
+                append(&mut job, &content[start..range.start], Color32::from_gray(212));
+                append(&mut job, &content[range.clone()], Color32::WHITE);
+                start = range.end;
+            }
+        }
+        append(&mut job, &line[start..], Color32::from_gray(212));
+    }
+    if text.is_empty() {
+        append(&mut job, "", Color32::from_gray(212));
+    }
+    job
+}
+
+#[derive(Default)]
+struct SearchHighlights {
+    snapshot: String,
+    lines: Vec<Vec<std::ops::Range<usize>>>,
+    active: bool,
+}
+
+impl SearchHighlights {
+    fn search(&mut self, text: &str, pattern: &str, case: bool) {
+        self.active = !pattern.is_empty();
+        if self.active {
+            self.snapshot = text.to_owned();
+            self.lines = text.split('\n').map(|line| match_ranges(line, pattern, case)).collect();
+        } else {
+            self.snapshot.clear();
+            self.lines.clear();
+        }
+    }
+
+    fn edited(&mut self, text: &str) {
+        if !self.active || self.snapshot == text {
+            return;
+        }
+        let old: Vec<_> = self.snapshot.split('\n').collect();
+        let new: Vec<_> = text.split('\n').collect();
+        let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b).count();
+        let end = self.lines.len().saturating_sub(suffix);
+        self.lines.splice(prefix..end, std::iter::repeat_with(Vec::new).take(new.len() - prefix - suffix));
+        self.snapshot = text.to_owned();
+    }
+
+    fn tailed(&mut self, text: &str, pattern: &str, case: bool) {
+        if !self.active {
+            return;
+        }
+        if !text.starts_with(&self.snapshot) {
+            self.search(text, pattern, case);
+            return;
+        }
+        let start = self.snapshot.rfind('\n').map_or(0, |i| i + 1);
+        let line = self.snapshot[..start].bytes().filter(|b| *b == b'\n').count();
+        self.lines.truncate(line);
+        self.lines.extend(text[start..].split('\n').map(|s| match_ranges(s, pattern, case)));
+        self.snapshot = text.to_owned();
+    }
+}
+
 #[derive(Default)]
 struct FilterState {
     // (0-based line number, line text)
@@ -172,6 +311,7 @@ fn column_keys(ctx: &egui::Context, tab: &mut Tab, galley: &egui::Galley) {
     }
     if cut || del {
         delete_column(&mut tab.text, &sel, galley);
+        tab.search_highlights.edited(&tab.text);
         let (l0, l1, x0, _) = sel.bounds();
         tab.col_sel = Some(ColSel { anchor: (l0, x0), head: (l1, x0) });
         tab.dirty = tab.text != tab.saved_text;
@@ -191,6 +331,8 @@ struct Tab {
     disk_len: u64,
     dirty: bool,
     filter: FilterState,
+    search_highlights: SearchHighlights,
+    highlight_color: HighlightColor,
     highlight: Option<usize>,
     scroll_to_highlight: bool,
     filter_open: bool,
@@ -512,6 +654,7 @@ fn reload_from_disk(tab: &mut Tab, path: &Path) -> bool {
     tab.crlf = s.contains("\r\n");
     tab.text = if tab.crlf { s.replace("\r\n", "\n") } else { s };
     tab.saved_text = tab.text.clone();
+    tab.search_highlights.search(&tab.text, &tab.applied.0, tab.applied.1);
     tab.disk_len = bytes.len() as u64;
     tab.dirty = false;
     tab.highlight = None;
@@ -705,6 +848,8 @@ impl App {
             disk_len,
             dirty: false,
             filter: FilterState::default(),
+            search_highlights: SearchHighlights::default(),
+            highlight_color: HighlightColor::default(),
             highlight: None,
             scroll_to_highlight: false,
             filter_open: false,
@@ -892,6 +1037,7 @@ impl App {
                 state.cursor.set_char_range(Some(new_range));
                 state.store(ctx, id);
                 tab.text = formatted;
+                tab.search_highlights.edited(&tab.text);
                 tab.dirty = tab.text != tab.saved_text;
                 tab.highlight = None;
                 tab.col_sel = None;
@@ -913,6 +1059,7 @@ impl App {
             self.filter_history.truncate(MAX_FILTER_HISTORY);
         }
         tab.applied = (text, tab.case_sensitive);
+        tab.search_highlights.search(&tab.text, &tab.applied.0, tab.applied.1);
         tab.filter.applied = None;
         self.update_filter(false);
     }
@@ -932,6 +1079,7 @@ impl App {
         }
         if disk_changed {
             tab.scroll_to_end = true;
+            tab.search_highlights.tailed(&tab.text, &tab.applied.0, tab.applied.1);
         }
         if !filter_open {
             return;
@@ -987,6 +1135,28 @@ impl App {
             if ui.checkbox(&mut tab.case_sensitive, "Case sensitive").changed() {
                 search = true;
             }
+            ui.scope(|ui| {
+                let selected = tab.highlight_color.color();
+                let widgets = &mut ui.visuals_mut().widgets;
+                for visuals in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+                    visuals.bg_fill = selected;
+                    visuals.weak_bg_fill = selected;
+                }
+                egui::ComboBox::from_id_salt(("highlight_color", tab.id))
+                    .selected_text(RichText::new(tab.highlight_color.name()).color(Color32::WHITE))
+                    .show_ui(ui, |ui| {
+                        for color in HighlightColor::ALL {
+                            egui::Frame::NONE.fill(color.color()).show(ui, |ui| {
+                                ui.set_min_width(105.0);
+                                ui.visuals_mut().selection.bg_fill = color.color();
+                                if ui.selectable_label(tab.highlight_color == color, RichText::new(color.name()).color(Color32::WHITE)).clicked() {
+                                    tab.highlight_color = color;
+                                    ui.close();
+                                }
+                            });
+                        }
+                    });
+            });
         });
         if search {
             self.apply_search();
@@ -1378,9 +1548,6 @@ impl App {
     fn editor_ui(&mut self, ui: &mut egui::Ui) {
         let font = FontId::monospace(self.font_size);
         let tab = &mut self.tabs[self.active];
-        if tab.tail && user_interacted(ui, ui.available_rect_before_wrap()) {
-            tab.tail = false;
-        }
         let wrap = tab.word_wrap;
         let hidden = tab.hidden_chars;
         let mut scroll_end = std::mem::take(&mut tab.scroll_to_end);
@@ -1440,20 +1607,10 @@ impl App {
         let row_h = ui.fonts_mut(|f| f.row_height(&font));
         let focus = std::mem::take(&mut self.focus_editor);
 
+        let mut highlights = std::mem::take(&mut tab.search_highlights);
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-            let s = text.as_str();
-            let shown: String = if hidden {
-                s.chars()
-                    .map(|c| match c {
-                        ' ' => '·',
-                        c => c,
-                    })
-                    .collect()
-            } else {
-                s.to_owned()
-            };
             let ww = if wrap { wrap_width } else { f32::INFINITY };
-            let job = egui::text::LayoutJob::simple(shown, font.clone(), Color32::from_gray(212), ww);
+            let job = search_layout(text.as_str(), &highlights, hidden, &font, ww);
             ui.fonts_mut(|f| f.layout_job(job))
         };
 
@@ -1495,6 +1652,7 @@ impl App {
                         }
                     }
                 }
+                let background = ui.painter().add(egui::Shape::Noop);
                 let out = ui
                     .horizontal_top(|ui| {
                         ui.add_space(gutter_w);
@@ -1587,6 +1745,28 @@ impl App {
 
                 let galley = &out.galley;
                 let painter = ui.painter();
+                if tab.highlight_color != HighlightColor::DarkGray
+                    && highlights.active && tab.text == highlights.snapshot
+                {
+                    let mut line = 0usize;
+                    let mut shapes = Vec::new();
+                    for row in &galley.rows {
+                        let y = out.galley_pos.y + row.rect().min.y;
+                        if !highlights.lines.get(line).is_none_or(Vec::is_empty)
+                            && y + row.rect().height() >= clip.top() && y <= clip.bottom()
+                        {
+                            let rect = egui::Rect::from_min_max(
+                                egui::pos2(clip.left() + gutter_w, y),
+                                egui::pos2(clip.right(), y + row.rect().height()),
+                            );
+                            shapes.push(egui::Shape::rect_filled(rect, 0.0, tab.highlight_color.color()));
+                        }
+                        if row.ends_with_newline {
+                            line += 1;
+                        }
+                    }
+                    painter.set(background, egui::Shape::Vec(shapes));
+                }
                 if hidden {
                     let marker_painter = painter.with_clip_rect(out.text_clip_rect.intersect(clip));
                     let stroke = egui::Stroke::new(1.0, Color32::from_gray(140));
@@ -1687,7 +1867,7 @@ impl App {
                             );
                             painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 214, 0, 55));
                             if scroll_to {
-                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                ui.scroll_with_delta(egui::vec2(0.0, clip.center().y - rect.center().y));
                                 scroll_to = false;
                             }
                         }
@@ -1703,6 +1883,11 @@ impl App {
                     tab.filter.applied = None;
                 }
             });
+        if highlights.active && highlights.snapshot != tab.text {
+            highlights.edited(&tab.text);
+            ui.ctx().request_repaint();
+        }
+        tab.search_highlights = highlights;
         self.status = status;
         if ui.memory(|memory| memory.has_focus(id)) {
             self.editor_selection = egui::text_edit::TextEditState::load(ui.ctx(), id)
@@ -2059,6 +2244,91 @@ mod tests {
     }
 
     #[test]
+    fn double_click_search_result_preserves_horizontal_scroll() {
+        for font_size in [14.0, 30.0] {
+            for horizontal in [0.0, 120.0] {
+                let ctx = egui::Context::default();
+                ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+                let mut app = test_app();
+                app.font_size = font_size;
+                let long_line = "abcdefghij".repeat(80);
+                app.tabs[0].text = (0..100).map(|i| {
+                    if i == 70 { format!("needle {long_line}") } else { format!("line {i} {long_line}") }
+                }).collect::<Vec<_>>().join("\n");
+                app.tabs[0].filter_open = true;
+                app.tabs[0].filter_text = "needle".into();
+                app.apply_search();
+                let mut time = 0.0;
+                let mut run = |app: &mut App, events: Vec<egui::Event>| {
+                    time += 0.05;
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    };
+                    let mut offset = egui::Vec2::ZERO;
+                    let mut editor_pos = None;
+                    let mut output = ctx.run_ui(input, |ui| {
+                        egui::Panel::bottom("test_filter").exact_size(150.0).show(ui, |ui| app.filter_ui(ui));
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            editor_pos = Some(ui.min_rect().min);
+                            app.editor_ui(ui);
+                        });
+                    });
+                    if let Some(pos) = editor_pos {
+                        let text = output.shapes.iter().find_map(|s| match &s.shape {
+                            egui::Shape::Text(t) if t.galley.rows.len() == 100 => Some(t),
+                            _ => None,
+                        }).unwrap();
+                        offset = egui::vec2(text.pos.x - pos.x, text.pos.y - pos.y);
+                    }
+                    output.textures_delta.clear();
+                    (output, offset)
+                };
+                if horizontal > 0.0 {
+                    // Set the offset using the actual editor scroll-area ID in the same panel.
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                        ..Default::default()
+                    };
+                    let mut output = ctx.run_ui(input, |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            egui::ScrollArea::both().id_salt(("scroll", app.tabs[0].id))
+                                .horizontal_scroll_offset(horizontal).show(ui, |ui| ui.set_min_size(egui::vec2(8000.0, 3000.0)));
+                        });
+                    });
+                    output.textures_delta.clear();
+                }
+                let (output, before) = run(&mut app, vec![]);
+                assert!(before.x.is_finite(), "{before:?}");
+                if horizontal > 0.0 {
+                    assert!(before.x < -20.0, "horizontal scroll was not established: {before:?}");
+                }
+                let label = format!("{:>6}  needle {long_line}", 71);
+                let pos = output.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text == label => Some(t.pos + egui::vec2(60.0, t.galley.rect.center().y)),
+                    _ => None,
+                }).unwrap();
+                let button = |pressed| egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                };
+                run(&mut app, vec![egui::Event::PointerMoved(pos), button(true)]);
+                run(&mut app, vec![button(false)]);
+                run(&mut app, vec![button(true)]);
+                let (_, after) = run(&mut app, vec![button(false)]);
+                let (_, settled) = run(&mut app, vec![]);
+                let (_, settled2) = run(&mut app, vec![]);
+                assert_eq!(app.tabs[0].highlight, Some(70));
+                assert!((after.x - before.x).abs() < 0.1, "{before:?} -> {after:?}");
+                assert!((settled.x - before.x).abs() < 0.1, "{before:?} -> {settled:?}");
+                assert!((settled2.x - before.x).abs() < 0.1, "{before:?} -> {settled2:?}");
+                assert!(settled2.y < before.y - 100.0, "{before:?} -> {after:?} -> {settled:?} -> {settled2:?}");
+            }
+        }
+    }
+
+    #[test]
     fn find_history_arrow_is_drawn_and_history_remains_selectable() {
         let ctx = egui::Context::default();
         let mut app = test_app();
@@ -2084,6 +2354,161 @@ mod tests {
         filter_frame(&ctx, &mut app, vec![button(pos, false)]);
         assert_eq!(app.tabs[0].filter_text, "history entry");
         assert_eq!(app.tabs[0].applied.0, "history entry");
+    }
+
+    #[test]
+    fn search_highlighting_tracks_color_searches_and_editing() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text = "alpha one\nbeta alpha\nother".into();
+        app.tabs[0].filter_text = "alpha".into();
+        app.apply_search();
+        assert_eq!(app.tabs[0].highlight_color, HighlightColor::DarkGray);
+        assert_eq!(app.tabs[0].search_highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![1, 1, 0]);
+        let output = frame(&ctx, &mut app, vec![], false);
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(v) if v.iter().any(|x| matches!(x, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkRed.color())))));
+        app.tabs[0].highlight_color = HighlightColor::DarkRed;
+        let output = frame(&ctx, &mut app, vec![], false);
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(v) if v.iter().filter(|x| matches!(x, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkRed.color())).count() == 2)));
+        let text = output.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.job.text.contains("alpha one") => Some(t),
+            _ => None,
+        }).unwrap();
+        assert!(text.galley.job.sections.iter().any(|s| s.format.color == Color32::WHITE && &text.galley.job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)] == "alpha"));
+        app.tabs[0].highlight_color = HighlightColor::DarkGray;
+        let output = frame(&ctx, &mut app, vec![], false);
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(v) if v.iter().any(|x| matches!(x, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkRed.color())))));
+        app.tabs[0].text = "alpha changed\nbeta alpha\nother".into();
+        let tab = &mut app.tabs[0];
+        tab.search_highlights.edited(&tab.text);
+        assert!(app.tabs[0].search_highlights.lines[0].is_empty());
+        assert!(!app.tabs[0].search_highlights.lines[1].is_empty());
+        app.tabs[0].filter_text = "other".into();
+        app.apply_search();
+        assert_eq!(app.tabs[0].search_highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn search_highlighting_handles_unicode_wrap_and_tail_updates() {
+        assert_eq!(match_ranges("İx İX", "i\u{307}x", false), vec![0..3, 4..7]);
+        assert_eq!(match_ranges("Alpha alpha", "alpha", true), vec![6..11]);
+        let mut highlights = SearchHighlights::default();
+        highlights.search("hit\nother\nhit", "hit", false);
+        highlights.edited("inserted\nhit\nother\nhit");
+        assert_eq!(highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
+        highlights.edited("inserted\nmodified hit\nother\nhit");
+        assert_eq!(highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![0, 0, 0, 1]);
+        highlights.tailed("inserted\nmodified hit\nother\nhit\nHIT", "hit", false);
+        assert_eq!(highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![0, 0, 0, 1, 1]);
+        let font = FontId::monospace(14.0);
+        let job = search_layout("inserted\nmodified hit\nother\nhit\nHIT", &highlights, true, &font, 60.0);
+        assert_eq!(job.wrap.max_width, 60.0);
+        assert!(job.sections.iter().any(|s| s.format.color == Color32::WHITE && &job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)] == "HIT"));
+        assert!(job.text.contains("modified·hit"));
+    }
+
+    #[test]
+    fn highlight_color_selector_changes_current_matches() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].filter_text = "abc".into();
+        app.apply_search();
+        let output = filter_frame(&ctx, &mut app, vec![]);
+        let pos = find_label(&output, "Dark Gray");
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        };
+        filter_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+        filter_frame(&ctx, &mut app, vec![button(pos, false)]);
+        let output = filter_frame(&ctx, &mut app, vec![]);
+        for color in HighlightColor::ALL {
+            find_label(&output, color.name());
+        }
+        let pos = find_label(&output, "Dark Blue");
+        filter_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+        filter_frame(&ctx, &mut app, vec![button(pos, false)]);
+        assert_eq!(app.tabs[0].highlight_color, HighlightColor::DarkBlue);
+        assert_eq!(app.tabs[0].search_highlights.lines.len(), 4);
+        let output = filter_frame(&ctx, &mut app, vec![]);
+        let pos = find_label(&output, "Dark Blue");
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkBlue.color() && r.rect.contains(pos))));
+        filter_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+        filter_frame(&ctx, &mut app, vec![button(pos, false)]);
+        let mut output = filter_frame(&ctx, &mut app, vec![]);
+        for _ in 0..30 {
+            output = filter_frame(&ctx, &mut app, vec![]);
+        }
+        for color in HighlightColor::ALL {
+            let texts: Vec<_> = output.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == color.name() => Some(t.pos + t.galley.rect.center().to_vec2()),
+                _ => None,
+            }).collect();
+            assert_eq!(texts.len(), if color == HighlightColor::DarkBlue { 2 } else { 1 });
+            for pos in texts {
+                let fills: Vec<_> = output.shapes.iter().filter_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.rect.contains(pos) && r.fill != Color32::TRANSPARENT => Some(r.fill),
+                    _ => None,
+                }).collect();
+                assert_eq!(fills.last(), Some(&color.color()), "{}: {fills:?}", color.name());
+            }
+        }
+    }
+
+    #[test]
+    fn actual_editor_edits_clear_only_the_edited_line_highlight() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text = "hit\nhit\nhit".into();
+        app.tabs[0].filter_text = "hit".into();
+        app.apply_search();
+        frame(&ctx, &mut app, vec![], false);
+        #[allow(deprecated)]
+        let id = egui::Id::new(("editor", app.tabs[0].id));
+        let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(5))));
+        state.store(&ctx, id);
+        frame(&ctx, &mut app, vec![egui::Event::Text("x".into())], false);
+        assert_eq!(app.tabs[0].search_highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![1, 0, 1]);
+    }
+
+    #[test]
+    fn tail_poll_highlights_appended_matches() {
+        let path = std::env::temp_dir().join(format!(
+            "rusted-highlight-{}-{}.txt", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, "hit\n").unwrap();
+        let mut app = test_app();
+        app.tabs[0].path = Some(path.clone());
+        assert!(reload_from_disk(&mut app.tabs[0], &path));
+        app.tabs[0].filter_open = true;
+        app.tabs[0].filter_text = "hit".into();
+        app.apply_search();
+        app.tabs[0].tail = true;
+        std::fs::write(&path, "hit\nmiss\nHIT\n").unwrap();
+        app.update_filter(true);
+        assert_eq!(app.tabs[0].search_highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![1, 0, 1, 0]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tail_editor_stays_read_only_when_clicked_and_typed() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].tail = true;
+        let output = frame(&ctx, &mut app, vec![], false);
+        let text = output.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.rows.len() == 4 => Some(t),
+            _ => None,
+        }).unwrap();
+        let pos = text.pos + text.galley.rows[0].rect().center().to_vec2();
+        let button = |pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        };
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), button(true)], false);
+        frame(&ctx, &mut app, vec![button(false), egui::Event::Text("x".into()), egui::Event::Paste("y".into())], false);
+        assert!(app.tabs[0].tail);
+        assert_eq!(app.tabs[0].text, "abcdefghij\nabcdefghij\nabcdefghij\nabcdefghij");
     }
 
     fn toolbar_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
