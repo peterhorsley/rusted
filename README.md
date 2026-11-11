@@ -69,11 +69,13 @@ Use Ctrl+Tab and Ctrl+Shift+Tab to cycle through open tabs.
 The Edit menu provides undo, redo, cut, copy and paste. The About > Program
 menu shows the application version. The toolbar beneath the file tabs opens
 Filter / Find and controls word wrap, hidden characters and tailing for the current tab.
-The Find bar offers five background colors for matching lines. Search replaces
+The Find bar offers five background colors for matching lines, defaulting to Dark Green. Search replaces
 the previous highlights; changing the color updates the current highlights.
 Matching text is white. Editing a highlighted line clears its highlight until
 the next search; newly tailed matches are highlighted automatically. Dark Gray
 uses the normal editor background. The main editor is read-only while tailing.
+Double-click a search result to jump to its line, shown in yellow text.
+Use File > Go to line (Ctrl+G) to jump to a line and mark its line number white.
 Use Ctrl+W, Ctrl+E and Ctrl+T respectively to toggle them.
 Enabling tail reloads the file and discards any unsaved edits; editing actions
 are disabled while tailing. Toolbar icons are embedded in the executable.
@@ -89,3 +91,5 @@ TODO
 - Syntax highlighting
 - Add link to github on about dialog
 - add a "minimap" feature the same as the one in vscode.  it's a vertical bar that shows the content of the entire file in 
+- - go to line Ctrl+G
+- replace text in file

@@ -13,9 +13,9 @@ const TAIL_POLL: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum HighlightColor {
-    #[default]
     DarkGray,
     DarkRed,
+    #[default]
     DarkGreen,
     DarkBlue,
     DarkPurple,
@@ -69,21 +69,26 @@ fn match_ranges(line: &str, pattern: &str, case: bool) -> Vec<std::ops::Range<us
     }).collect()
 }
 
-fn search_layout(text: &str, highlights: &SearchHighlights, hidden: bool, font: &FontId, width: f32) -> egui::text::LayoutJob {
+fn search_layout(text: &str, highlights: &SearchHighlights, selected_line: Option<usize>, hidden: bool, font: &FontId, width: f32) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = width;
     let append = |job: &mut egui::text::LayoutJob, s: &str, color| {
         let shown = if hidden { s.replace(' ', "·") } else { s.to_owned() };
         job.append(&shown, 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
     };
-    if !highlights.active || text != highlights.snapshot {
+    let matches_current_text = highlights.active && text == highlights.snapshot;
+    if !matches_current_text && selected_line.is_none() {
         append(&mut job, text, Color32::from_gray(212));
         return job;
     }
     for (i, line) in text.split_inclusive('\n').enumerate() {
+        if selected_line == Some(i) {
+            append(&mut job, line, Color32::YELLOW);
+            continue;
+        }
         let content = line.strip_suffix('\n').unwrap_or(line);
         let mut start = 0;
-        if let Some(ranges) = highlights.lines.get(i) {
+        if let Some(ranges) = matches_current_text.then(|| highlights.lines.get(i)).flatten() {
             for range in ranges {
                 if range.start < start {
                     continue;
@@ -335,6 +340,11 @@ struct Tab {
     highlight_color: HighlightColor,
     highlight: Option<usize>,
     scroll_to_highlight: bool,
+    goto_open: bool,
+    goto_text: String,
+    focus_goto: bool,
+    goto_line: Option<usize>,
+    scroll_to_goto: Option<usize>,
     filter_open: bool,
     filter_text: String,
     case_sensitive: bool,
@@ -739,6 +749,54 @@ impl App {
         }
     }
 
+    fn goto_shortcut(&mut self, ctx: &egui::Context) {
+        if self.browser.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
+            self.open_goto();
+        }
+    }
+
+    fn open_goto(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        tab.goto_open = true;
+        tab.goto_text.clear();
+        tab.focus_goto = true;
+        self.focus_editor = false;
+    }
+
+    fn goto_ui(&mut self, ui: &mut egui::Ui) {
+        let tab = &mut self.tabs[self.active];
+        let mut go = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            ui.label("Line:");
+            let response = ui.add(TextEdit::singleline(&mut tab.goto_text)
+                .id(egui::Id::unique(("goto_input", tab.id))).desired_width(100.0));
+            if std::mem::take(&mut tab.focus_goto) {
+                response.request_focus();
+            }
+            go |= response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            go |= ui.button("Go").clicked();
+            cancel |= ui.button("Cancel").clicked();
+        });
+        if go && !tab.goto_text.is_empty() && tab.goto_text.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(line) = tab.goto_text.parse::<usize>() {
+                let total = tab.text.bytes().filter(|&b| b == b'\n').count() + 1;
+                if (1..=total).contains(&line) {
+                    tab.goto_line = Some(line - 1);
+                    tab.scroll_to_goto = Some(line - 1);
+                    tab.scroll_to_highlight = false;
+                    tab.scroll_to_end = false;
+                    tab.goto_open = false;
+                    self.focus_editor = true;
+                }
+            }
+        }
+        if cancel {
+            tab.goto_open = false;
+            self.focus_editor = true;
+        }
+    }
+
     fn tab_shortcuts(&mut self, ctx: &egui::Context) {
         let steps = ctx.input_mut(|input| {
             let mut steps = Vec::new();
@@ -852,6 +910,11 @@ impl App {
             highlight_color: HighlightColor::default(),
             highlight: None,
             scroll_to_highlight: false,
+            goto_open: false,
+            goto_text: String::new(),
+            focus_goto: false,
+            goto_line: None,
+            scroll_to_goto: None,
             filter_open: false,
             filter_text: String::new(),
             case_sensitive: false,
@@ -1250,6 +1313,10 @@ impl App {
                     self.toggle_filter();
                     ui.close();
                 }
+                if ui.add_enabled(self.browser.is_none(), egui::Button::new("Go to line").shortcut_text("Ctrl+G")).clicked() {
+                    self.open_goto();
+                    ui.close();
+                }
             });
             let editable = self.browser.is_none() && !self.tabs[self.active].tail;
             let mut action = None;
@@ -1608,9 +1675,11 @@ impl App {
         let focus = std::mem::take(&mut self.focus_editor);
 
         let mut highlights = std::mem::take(&mut tab.search_highlights);
+        let hl = tab.highlight;
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
             let ww = if wrap { wrap_width } else { f32::INFINITY };
-            let job = search_layout(text.as_str(), &highlights, hidden, &font, ww);
+            let selected_line = if highlights.active && text.as_str() != highlights.snapshot { None } else { hl };
+            let job = search_layout(text.as_str(), &highlights, selected_line, hidden, &font, ww);
             ui.fonts_mut(|f| f.layout_job(job))
         };
 
@@ -1624,8 +1693,8 @@ impl App {
             let galley = layouter(ui, &tab.text, f32::INFINITY);
             column_keys(ui.ctx(), tab, &galley);
         }
-        let hl = tab.highlight;
         let mut scroll_to = std::mem::take(&mut tab.scroll_to_highlight);
+        let mut goto_target = tab.scroll_to_goto.take();
         egui::ScrollArea::both()
             .id_salt(("scroll", tab.id))
             .auto_shrink([false, false])
@@ -1847,8 +1916,14 @@ impl App {
                             egui::Align2::RIGHT_TOP,
                             line.to_string(),
                             font.clone(),
-                            Color32::from_gray(110),
+                            if tab.goto_line == Some(line - 1) { Color32::WHITE } else { Color32::from_gray(110) },
                         );
+                    }
+                    if new_line && goto_target == Some(line - 1) {
+                        if y < clip.top() || y + row_h > clip.bottom() {
+                            ui.scroll_with_delta(egui::vec2(0.0, clip.center().y - (y + row_h / 2.0)));
+                        }
+                        goto_target = None;
                     }
                     if hidden && row.ends_with_newline && y + row_h >= clip.top() && y <= clip.bottom() {
                         painter.text(
@@ -1865,7 +1940,6 @@ impl App {
                                 egui::pos2(clip.left() + gutter_w, y),
                                 egui::vec2(clip.width() - gutter_w, row_h),
                             );
-                            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 214, 0, 55));
                             if scroll_to {
                                 ui.scroll_with_delta(egui::vec2(0.0, clip.center().y - rect.center().y));
                                 scroll_to = false;
@@ -1885,6 +1959,9 @@ impl App {
             });
         if highlights.active && highlights.snapshot != tab.text {
             highlights.edited(&tab.text);
+            ui.ctx().request_repaint();
+        }
+        if hl != tab.highlight {
             ui.ctx().request_repaint();
         }
         tab.search_highlights = highlights;
@@ -1945,6 +2022,7 @@ impl eframe::App for App {
             self.save();
         }
         self.view_shortcuts(ctx);
+        self.goto_shortcut(ctx);
         if ctx.input_mut(|i| {
             i.consume_key(Modifiers::NONE, Key::F5) | i.consume_key(Modifiers::COMMAND, Key::R)
         }) {
@@ -2005,6 +2083,9 @@ impl eframe::App for App {
                 }
             });
         });
+        if self.tabs[self.active].goto_open && self.browser.is_none() {
+            egui::Panel::bottom(("goto", self.tabs[self.active].id)).show(root, |ui| self.goto_ui(ui));
+        }
         if self.tabs[self.active].filter_open && self.browser.is_none() {
             egui::Panel::bottom(("filter", self.tabs[self.active].id))
                 .resizable(true)
@@ -2258,6 +2339,7 @@ mod tests {
                 app.tabs[0].filter_open = true;
                 app.tabs[0].filter_text = "needle".into();
                 app.apply_search();
+                app.tabs[0].highlight_color = HighlightColor::DarkRed;
                 let mut time = 0.0;
                 let mut run = |app: &mut App, events: Vec<egui::Event>| {
                     time += 0.05;
@@ -2318,8 +2400,18 @@ mod tests {
                 run(&mut app, vec![button(true)]);
                 let (_, after) = run(&mut app, vec![button(false)]);
                 let (_, settled) = run(&mut app, vec![]);
-                let (_, settled2) = run(&mut app, vec![]);
+                let (output, settled2) = run(&mut app, vec![]);
                 assert_eq!(app.tabs[0].highlight, Some(70));
+                let text = output.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.rows.len() == 100 => Some(t),
+                    _ => None,
+                }).unwrap();
+                assert!(text.galley.job.sections.iter().any(|s| {
+                    s.format.color == Color32::YELLOW
+                        && text.galley.job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)].starts_with("needle ")
+                }));
+                assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == Color32::from_rgba_unmultiplied(255, 214, 0, 55))));
+                assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(v) if v.iter().any(|shape| matches!(shape, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkRed.color())))));
                 assert!((after.x - before.x).abs() < 0.1, "{before:?} -> {after:?}");
                 assert!((settled.x - before.x).abs() < 0.1, "{before:?} -> {settled:?}");
                 assert!((settled2.x - before.x).abs() < 0.1, "{before:?} -> {settled2:?}");
@@ -2363,10 +2455,10 @@ mod tests {
         app.tabs[0].text = "alpha one\nbeta alpha\nother".into();
         app.tabs[0].filter_text = "alpha".into();
         app.apply_search();
-        assert_eq!(app.tabs[0].highlight_color, HighlightColor::DarkGray);
+        assert_eq!(app.tabs[0].highlight_color, HighlightColor::DarkGreen);
         assert_eq!(app.tabs[0].search_highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![1, 1, 0]);
         let output = frame(&ctx, &mut app, vec![], false);
-        assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(v) if v.iter().any(|x| matches!(x, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkRed.color())))));
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(v) if v.iter().filter(|x| matches!(x, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkGreen.color())).count() == 2)));
         app.tabs[0].highlight_color = HighlightColor::DarkRed;
         let output = frame(&ctx, &mut app, vec![], false);
         assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(v) if v.iter().filter(|x| matches!(x, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkRed.color())).count() == 2)));
@@ -2378,6 +2470,7 @@ mod tests {
         app.tabs[0].highlight_color = HighlightColor::DarkGray;
         let output = frame(&ctx, &mut app, vec![], false);
         assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(v) if v.iter().any(|x| matches!(x, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkRed.color())))));
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(v) if v.iter().any(|x| matches!(x, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkGreen.color())))));
         app.tabs[0].text = "alpha changed\nbeta alpha\nother".into();
         let tab = &mut app.tabs[0];
         tab.search_highlights.edited(&tab.text);
@@ -2401,10 +2494,32 @@ mod tests {
         highlights.tailed("inserted\nmodified hit\nother\nhit\nHIT", "hit", false);
         assert_eq!(highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![0, 0, 0, 1, 1]);
         let font = FontId::monospace(14.0);
-        let job = search_layout("inserted\nmodified hit\nother\nhit\nHIT", &highlights, true, &font, 60.0);
+        let job = search_layout("inserted\nmodified hit\nother\nhit\nHIT", &highlights, None, true, &font, 60.0);
         assert_eq!(job.wrap.max_width, 60.0);
         assert!(job.sections.iter().any(|s| s.format.color == Color32::WHITE && &job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)] == "HIT"));
         assert!(job.text.contains("modified·hit"));
+    }
+
+    #[test]
+    fn selected_search_line_uses_yellow_text_without_overriding_other_matches() {
+        let mut highlights = SearchHighlights::default();
+        let text = "hit first\nhit second\nother";
+        highlights.search(text, "hit", false);
+        for hidden in [false, true] {
+            for width in [60.0, f32::INFINITY] {
+                let job = search_layout(text, &highlights, Some(1), hidden, &FontId::monospace(14.0), width);
+                let sections: Vec<_> = job.sections.iter().map(|s| (
+                    s.format.color,
+                    &job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)],
+                )).collect();
+                assert!(sections.iter().any(|(color, text)| *color == Color32::WHITE && *text == "hit"));
+                assert!(sections.iter().any(|(color, text)| *color == Color32::YELLOW && text.starts_with("hit")));
+                assert!(!sections.iter().any(|(color, text)| *color == Color32::WHITE && text.contains("second")));
+            }
+        }
+        highlights.active = false;
+        let job = search_layout(text, &highlights, Some(1), false, &FontId::monospace(14.0), f32::INFINITY);
+        assert!(job.sections.iter().any(|s| s.format.color == Color32::YELLOW));
     }
 
     #[test]
@@ -2414,7 +2529,8 @@ mod tests {
         app.tabs[0].filter_text = "abc".into();
         app.apply_search();
         let output = filter_frame(&ctx, &mut app, vec![]);
-        let pos = find_label(&output, "Dark Gray");
+        let pos = find_label(&output, "Dark Green");
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == HighlightColor::DarkGreen.color() && r.rect.contains(pos))));
         let button = |pos, pressed| egui::Event::PointerButton {
             pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
         };
@@ -2538,6 +2654,160 @@ mod tests {
             egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
             _ => None,
         }).collect::<Vec<_>>()))
+    }
+
+    fn goto_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            app.goto_shortcut(ui.ctx());
+            egui::Panel::top("test_menu").show(ui, |ui| app.menu_bar(ui));
+            egui::Panel::bottom("test_status").show(ui, |ui| { ui.label("Status"); });
+            if app.tabs[app.active].goto_open && app.browser.is_none() {
+                egui::Panel::bottom(("goto", app.tabs[app.active].id)).show(ui, |ui| app.goto_ui(ui));
+            }
+            if app.tabs[app.active].filter_open && app.browser.is_none() {
+                egui::Panel::bottom("test_goto_filter").exact_size(150.0).show(ui, |ui| app.filter_ui(ui));
+            }
+            egui::CentralPanel::default().show(ui, |ui| {
+                if app.browser.is_some() { app.browser_ui(ui); } else { app.editor_ui(ui); }
+            });
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    fn goto_click(ctx: &egui::Context, app: &mut App, pos: egui::Pos2) -> egui::FullOutput {
+        let button = |pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        };
+        goto_frame(ctx, app, vec![egui::Event::PointerMoved(pos), button(true)]);
+        goto_frame(ctx, app, vec![button(false)]);
+        goto_frame(ctx, app, vec![])
+    }
+
+    #[test]
+    fn goto_line_shortcut_validation_cancel_and_tab_state() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let key = egui::Event::Key {
+            key: Key::G, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND,
+        };
+        let output = goto_frame(&ctx, &mut app, vec![key.clone()]);
+        assert!(app.tabs[0].goto_open);
+        assert!(ctx.memory(|m| m.has_focus(egui::Id::unique(("goto_input", app.tabs[0].id)))));
+        assert!(find_label(&output, "Line:").y < find_label(&output, "Status").y);
+        for invalid in ["", "0", "5", "1x", "-1", "999999999999999999999999999999999"] {
+            app.tabs[0].goto_text = invalid.into();
+            let output = goto_frame(&ctx, &mut app, vec![]);
+            goto_click(&ctx, &mut app, find_label(&output, "Go"));
+            assert!(app.tabs[0].goto_open, "{invalid:?}");
+            assert_eq!(app.tabs[0].goto_line, None);
+        }
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        goto_click(&ctx, &mut app, find_label(&output, "Cancel"));
+        assert!(!app.tabs[0].goto_open);
+        goto_frame(&ctx, &mut app, vec![key.clone()]);
+        goto_frame(&ctx, &mut app, vec![egui::Event::Text("4".into())]);
+        assert_eq!(app.tabs[0].goto_text, "4");
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        goto_click(&ctx, &mut app, find_label(&output, "Go"));
+        assert!(!app.tabs[0].goto_open);
+        assert_eq!(app.tabs[0].goto_line, Some(3));
+        app.tabs[0].text = "first\n".into();
+        goto_frame(&ctx, &mut app, vec![key.clone()]);
+        goto_frame(&ctx, &mut app, vec![egui::Event::Text("2".into())]);
+        let enter = egui::Event::Key {
+            key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE,
+        };
+        goto_frame(&ctx, &mut app, vec![enter]);
+        assert!(!app.tabs[0].goto_open);
+        assert_eq!(app.tabs[0].goto_line, Some(1));
+        app.new_tab(None, "other".into(), false, 0);
+        assert_eq!(app.tabs[1].goto_line, None);
+        app.open_browser();
+        goto_frame(&ctx, &mut app, vec![key]);
+        assert!(!app.tabs[1].goto_open);
+    }
+
+    #[test]
+    fn goto_line_menu_scrolls_and_paints_white_with_wrap_and_tail() {
+        for wrap in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            let mut app = test_app();
+            app.tabs[0].text = (1..=100).map(|i| format!("line {i} {}", "abcdefghij".repeat(12)))
+                .collect::<Vec<_>>().join("\n");
+            app.tabs[0].word_wrap = wrap;
+            app.tabs[0].tail = true;
+            app.tabs[0].filter_open = true;
+            let output = goto_frame(&ctx, &mut app, vec![]);
+            let output = goto_click(&ctx, &mut app, find_label(&output, "File"));
+            let output = goto_click(&ctx, &mut app, find_label(&output, "Go to line"));
+            assert!(app.tabs[0].goto_open);
+            assert!(ctx.memory(|m| m.has_focus(egui::Id::unique(("goto_input", app.tabs[0].id)))));
+            app.tabs[0].goto_text = "71".into();
+            goto_click(&ctx, &mut app, find_label(&output, "Go"));
+            let output = goto_frame(&ctx, &mut app, vec![]);
+            assert!(app.tabs[0].tail);
+            assert_eq!(app.tabs[0].goto_line, Some(70));
+            let number = output.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "71" => Some(t),
+                _ => None,
+            }).expect("target line number is not visible");
+            assert_eq!(number.galley.job.sections[0].format.color, Color32::WHITE);
+            assert!(number.pos.y >= 0.0 && number.pos.y < find_label(&output, "Status").y);
+            let other = output.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "70" => Some(t),
+                _ => None,
+            });
+            if let Some(other) = other {
+                assert_eq!(other.galley.job.sections[0].format.color, Color32::from_gray(110));
+            }
+        }
+    }
+
+    #[test]
+    fn goto_line_preserves_horizontal_scroll_and_search_highlight() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+        let mut app = test_app();
+        app.tabs[0].text = (0..100).map(|i| format!("line {i} {}", "abcdefghij".repeat(80)))
+            .collect::<Vec<_>>().join("\n");
+        app.tabs[0].filter_text = "line".into();
+        app.apply_search();
+        app.tabs[0].highlight = Some(2);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::Panel::top("test_menu").show(ui, |ui| app.menu_bar(ui));
+            egui::Panel::bottom("test_status").show(ui, |ui| { ui.label("Status"); });
+            egui::CentralPanel::default().show(ui, |ui| {
+                egui::ScrollArea::both().id_salt(("scroll", app.tabs[0].id))
+                    .horizontal_scroll_offset(120.0).show(ui, |ui| ui.set_min_size(egui::vec2(8000.0, 3000.0)));
+            });
+        });
+        output.textures_delta.clear();
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        let text_x = |output: &egui::FullOutput| output.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.job.text.starts_with("line 0 ") => Some(t.pos.x),
+            _ => None,
+        }).unwrap();
+        let before = text_x(&output);
+        assert!(before < -20.0);
+        app.open_goto();
+        app.tabs[0].goto_text = "71".into();
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        goto_click(&ctx, &mut app, find_label(&output, "Go"));
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        assert!((text_x(&output) - before).abs() < 0.1);
+        assert_eq!(app.tabs[0].highlight, Some(2));
+        assert!(app.tabs[0].search_highlights.active);
     }
 
     fn tab_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
