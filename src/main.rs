@@ -174,7 +174,7 @@ fn column_keys(ctx: &egui::Context, tab: &mut Tab, galley: &egui::Galley) {
         delete_column(&mut tab.text, &sel, galley);
         let (l0, l1, x0, _) = sel.bounds();
         tab.col_sel = Some(ColSel { anchor: (l0, x0), head: (l1, x0) });
-        tab.dirty = true;
+        tab.dirty = tab.text != tab.saved_text;
         tab.highlight = None;
     } else if clear {
         tab.col_sel = None;
@@ -185,6 +185,7 @@ struct Tab {
     id: u64,
     path: Option<PathBuf>,
     text: String,
+    saved_text: String,
     crlf: bool,
     // Bytes of the file on disk that are reflected in `text`.
     disk_len: u64,
@@ -214,6 +215,19 @@ impl Tab {
                 .unwrap_or_else(|| p.to_string_lossy().into_owned()),
             None => "Untitled".to_owned(),
         }
+    }
+
+    fn tab_title(&self) -> String {
+        let title = self.title();
+        if self.path.is_some() && self.dirty { format!("{title}*") } else { title }
+    }
+
+    fn tooltip(&self) -> String {
+        let name = self.path.as_ref().map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.title());
+        let prefix = if self.tail { "Tailing " } else { "" };
+        let suffix = if self.dirty { " (unsaved)" } else { "" };
+        format!("{prefix}{name}{suffix}")
     }
 }
 
@@ -295,6 +309,7 @@ struct ToolbarIcons {
     wrap: egui::TextureHandle,
     hidden: egui::TextureHandle,
     tail: egui::TextureHandle,
+    format_json: egui::TextureHandle,
 }
 
 enum EditAction {
@@ -353,6 +368,7 @@ impl ToolbarIcons {
             wrap: load_icon(ctx, "wordwrap", include_bytes!("assets/wordwrap.png"))?,
             hidden: load_icon(ctx, "hidden", include_bytes!("assets/hidden-characters.png"))?,
             tail: load_icon(ctx, "tail", include_bytes!("assets/tail.png"))?,
+            format_json: load_icon(ctx, "format-json", include_bytes!("assets/copy.png"))?,
         })
     }
 }
@@ -362,6 +378,60 @@ fn toolbar_button(icon: &egui::TextureHandle, label: &str, selected: bool) -> eg
     let size = native * (20.0 / native.x.max(native.y));
     let image = egui::Image::new((icon.id(), size));
     egui::Button::image_and_text(image, label.to_owned()).selected(selected)
+}
+
+fn format_json(text: &str) -> Result<String, serde_json::Error> {
+    let _: &serde_json::value::RawValue = serde_json::from_str(text)?;
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            output.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                output.push(c);
+            }
+            '{' | '[' => {
+                output.push(c);
+                depth += 1;
+                if !chars.clone().find(|c| !c.is_ascii_whitespace())
+                    .is_some_and(|next| matches!((c, next), ('{', '}') | ('[', ']')))
+                {
+                    output.push('\n');
+                    output.push_str(&"  ".repeat(depth));
+                }
+            }
+            '}' | ']' => {
+                depth -= 1;
+                if !matches!(output.chars().last(), Some('{') | Some('[')) {
+                    output.push('\n');
+                    output.push_str(&"  ".repeat(depth));
+                }
+                output.push(c);
+            }
+            ',' => {
+                output.push_str(",\n");
+                output.push_str(&"  ".repeat(depth));
+            }
+            ':' => output.push_str(": "),
+            ' ' | '\n' | '\r' | '\t' => {}
+            _ => output.push(c),
+        }
+    }
+    Ok(output)
 }
 
 struct App {
@@ -441,6 +511,7 @@ fn reload_from_disk(tab: &mut Tab, path: &Path) -> bool {
     let s = String::from_utf8_lossy(&bytes).into_owned();
     tab.crlf = s.contains("\r\n");
     tab.text = if tab.crlf { s.replace("\r\n", "\n") } else { s };
+    tab.saved_text = tab.text.clone();
     tab.disk_len = bytes.len() as u64;
     tab.dirty = false;
     tab.highlight = None;
@@ -485,11 +556,9 @@ fn read_tail(tab: &mut Tab, path: &Path) -> bool {
     if buf.is_empty() {
         return false;
     }
-    if tab.crlf {
-        tab.text.push_str(&s.replace("\r\n", "\n"));
-    } else {
-        tab.text.push_str(&s);
-    }
+    let s = if tab.crlf { s.replace("\r\n", "\n") } else { s };
+    tab.text.push_str(&s);
+    tab.saved_text.push_str(&s);
     tab.disk_len += buf.len() as u64;
     true
 }
@@ -525,6 +594,39 @@ impl App {
                 self.toggle_tail();
             }
         }
+    }
+
+    fn tab_shortcuts(&mut self, ctx: &egui::Context) {
+        let steps = ctx.input_mut(|input| {
+            let mut steps = Vec::new();
+            input.events.retain(|event| {
+                if let egui::Event::Key { key: Key::Tab, pressed: true, modifiers, .. } = event {
+                    if modifiers.ctrl && !modifiers.alt && !modifiers.mac_cmd {
+                        steps.push(modifiers.shift);
+                        return false;
+                    }
+                }
+                true
+            });
+            steps
+        });
+        if self.tabs.len() < 2 {
+            return;
+        }
+        for backwards in steps {
+            let next = if backwards {
+                if self.active == 0 { self.tabs.len() - 1 } else { self.active - 1 }
+            } else {
+                (self.active + 1) % self.tabs.len()
+            };
+            self.select_tab(next);
+        }
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        self.active = index;
+        self.browser = None;
+        self.focus_editor = true;
     }
 
     fn edit_availability(&self, ui: &egui::Ui) -> (bool, bool, bool) {
@@ -597,6 +699,7 @@ impl App {
         self.tabs.push(Tab {
             id: self.next_id,
             path,
+            saved_text: text.clone(),
             text,
             crlf,
             disk_len,
@@ -657,10 +760,37 @@ impl App {
         self.message = None;
     }
 
+    fn open_dropped_files(&mut self, files: Vec<egui::DroppedFileHandle>) {
+        let mut errors = Vec::new();
+        for file in files {
+            let path = file.path();
+            if path.as_os_str().is_empty() {
+                errors.push("Dropped file has no local path".to_owned());
+                continue;
+            }
+            match std::fs::metadata(path) {
+                Ok(metadata) if metadata.is_file() => {
+                    self.browser = None;
+                    self.message = None;
+                    self.open_path(path.to_path_buf());
+                    if let Some(error) = self.message.take() {
+                        errors.push(error);
+                    }
+                }
+                Ok(_) => errors.push(format!("Cannot open {}: not a regular file", path.display())),
+                Err(error) => errors.push(format!("Cannot open {}: {error}", path.display())),
+            }
+        }
+        if !errors.is_empty() {
+            self.message = Some(errors.join("; "));
+        }
+    }
+
     fn add_recent(&mut self, path: PathBuf) {
         self.recent.retain(|p| p != &path);
         self.recent.insert(0, path);
         self.recent.truncate(MAX_RECENT);
+        #[cfg(not(test))]
         if let Some(f) = recent_file() {
             if let Some(d) = f.parent() {
                 let _ = std::fs::create_dir_all(d);
@@ -678,6 +808,7 @@ impl App {
             Ok(()) => {
                 tab.path = Some(path.clone());
                 tab.dirty = false;
+                tab.saved_text = tab.text.clone();
                 tab.disk_len = data.len() as u64;
                 tab.filter.needs_rescan = true;
                 self.message = None;
@@ -738,6 +869,41 @@ impl App {
         }
     }
 
+    fn format_current_json(&mut self, ctx: &egui::Context) {
+        let tab = &mut self.tabs[self.active];
+        match format_json(&tab.text) {
+            Ok(formatted) => {
+                self.message = None;
+                if formatted == tab.text {
+                    return;
+                }
+                #[allow(deprecated)]
+                let id = egui::Id::new(("editor", tab.id));
+                let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+                let old_range = state.cursor.char_range()
+                    .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+                let cursor = usize::from(old_range.primary.index).min(formatted.chars().count());
+                let new_range = egui::text::CCursorRange::one(egui::text::CCursor::new(cursor));
+                let mut undoer = state.undoer();
+                undoer.add_undo(&(old_range, tab.text.clone()));
+                undoer.feed_state(ctx.input(|input| input.time), &(new_range, formatted.clone()));
+                undoer.add_undo(&(new_range, formatted.clone()));
+                state.set_undoer(undoer);
+                state.cursor.set_char_range(Some(new_range));
+                state.store(ctx, id);
+                tab.text = formatted;
+                tab.dirty = tab.text != tab.saved_text;
+                tab.highlight = None;
+                tab.col_sel = None;
+                tab.col_drag = false;
+                tab.filter.applied = None;
+                self.editor_selection = Some((tab.id, new_range));
+                self.focus_editor = true;
+            }
+            Err(error) => self.message = Some(format!("Cannot format JSON: {error}")),
+        }
+    }
+
     fn apply_search(&mut self) {
         let tab = &mut self.tabs[self.active];
         let text = tab.filter_text.clone();
@@ -789,7 +955,7 @@ impl App {
         let history = self.filter_history.clone();
         let tab = &mut self.tabs[self.active];
         ui.horizontal(|ui| {
-            ui.label("Filter:");
+            ui.label("Find:");
             let r = ui.add(TextEdit::singleline(&mut tab.filter_text).desired_width(320.0));
             if std::mem::take(&mut tab.focus_filter) {
                 r.request_focus();
@@ -798,7 +964,14 @@ impl App {
                 search = true;
             }
             ui.add_enabled_ui(!history.is_empty(), |ui| {
-                ui.menu_button("▾", |ui| {
+                let arrow = egui::Atom::paint(egui::vec2(12.0, 12.0), |ui, args| {
+                    ui.painter().add(egui::Shape::rotated_triangle(
+                        egui::Rect::from_center_size(args.rect.center(), egui::vec2(8.0, 6.0)),
+                        0.0,
+                        args.fallback_text_color,
+                    ));
+                });
+                ui.menu_button(arrow, |ui| {
                     for h in history {
                         if ui.button(&h).clicked() {
                             tab.filter_text = h;
@@ -806,7 +979,7 @@ impl App {
                             ui.close();
                         }
                     }
-                });
+                }).response.on_hover_text("Find history");
             });
             if ui.button("Search").clicked() {
                 search = true;
@@ -903,7 +1076,7 @@ impl App {
                     self.reload();
                     ui.close();
                 }
-                if ui.add(egui::Button::new("Filter / Find").shortcut_text("F4 / Ctrl+F")).clicked() {
+                if ui.add(egui::Button::new("Find").shortcut_text("F4 / Ctrl+F")).clicked() {
                     self.toggle_filter();
                     ui.close();
                 }
@@ -997,10 +1170,13 @@ impl App {
         };
         let mut toggle_tail = false;
         let mut toggle_filter = false;
+        let mut format_json = false;
         let tab = &mut self.tabs[self.active];
+        let is_json = tab.path.as_ref().and_then(|path| path.extension())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
         ui.horizontal(|ui| {
             if ui.add_enabled(self.browser.is_none(), toolbar_button(&icons.find, "Find", tab.filter_open))
-                .on_hover_text("Filter / Find (F4 / Ctrl+F)")
+                .on_hover_text("Find (F4 / Ctrl+F)")
                 .clicked()
             {
                 toggle_filter = true;
@@ -1023,6 +1199,12 @@ impl App {
             {
                 toggle_tail = true;
             }
+            if is_json && ui.add_enabled(
+                self.browser.is_none() && !tab.tail,
+                toolbar_button(&icons.format_json, "Format JSON", false),
+            ).on_hover_text("Format JSON with two-space indentation").clicked() {
+                format_json = true;
+            }
         });
         if toggle_filter {
             self.toggle_filter();
@@ -1030,43 +1212,67 @@ impl App {
         if toggle_tail {
             self.toggle_tail();
         }
+        if format_json {
+            self.format_current_json(ui.ctx());
+        }
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let mut select = None;
             let mut close = None;
+            let mut close_others = None;
             for (i, t) in self.tabs.iter().enumerate() {
                 let title = if t.tail {
                     // Leave room for the spinner painted over the start of the label.
                     let body = egui::TextStyle::Body.resolve(ui.style());
                     let space_w = ui.fonts_mut(|f| f.glyph_width(&body, ' ')).max(1.0);
                     let n = (body.size / space_w).ceil() as usize + 1;
-                    format!("{}{}", " ".repeat(n), t.title())
+                    format!("{}{}", " ".repeat(n), t.tab_title())
                 } else {
-                    t.title()
+                    t.tab_title()
                 };
-                let mut r = ui.selectable_label(self.browser.is_none() && i == self.active, title);
-                if t.tail {
-                    paint_spinner(ui, &r);
-                }
-                if let Some(p) = &t.path {
-                    let path = p.to_string_lossy();
-                    r = r.on_hover_text(if t.tail { format!("Tailing {path}") } else { path.into_owned() });
-                }
-                if r.clicked() {
-                    select = Some(i);
-                }
-                if r.middle_clicked() {
-                    close = Some(i);
-                }
+                ui.push_id(t.id, |ui| {
+                    let r = ui.selectable_label(self.browser.is_none() && i == self.active, title)
+                        .on_hover_text(t.tooltip());
+                    if t.tail {
+                        paint_spinner(ui, &r);
+                    }
+                    r.context_menu(|ui| {
+                        if ui.button("Close").clicked() {
+                            close = Some(i);
+                            ui.close();
+                        }
+                        if ui.button("Close all others").clicked() {
+                            close_others = Some(i);
+                            ui.close();
+                        }
+                        if ui.add_enabled(t.path.is_some(), egui::Button::new("Copy file path")).clicked() {
+                            if let Some(path) = &t.path {
+                                ui.ctx().copy_text(path.to_string_lossy().into_owned());
+                            }
+                            ui.close();
+                        }
+                    });
+                    if r.clicked() {
+                        select = Some(i);
+                    }
+                    if r.middle_clicked() {
+                        close = Some(i);
+                    }
+                });
             }
             if let Some(i) = close {
                 self.close_tab(i);
-            } else if let Some(i) = select {
-                self.active = i;
+            } else if let Some(i) = close_others {
+                let keep = self.tabs.remove(i);
+                self.tabs.clear();
+                self.tabs.push(keep);
+                self.active = 0;
                 self.browser = None;
                 self.focus_editor = true;
+            } else if let Some(i) = select {
+                self.select_tab(i);
             }
         });
     }
@@ -1492,8 +1698,9 @@ impl App {
                     }
                 }
                 if out.response.changed() {
-                    tab.dirty = true;
+                    tab.dirty = tab.text != tab.saved_text;
                     tab.highlight = None;
+                    tab.filter.applied = None;
                 }
             });
         self.status = status;
@@ -1516,6 +1723,10 @@ impl eframe::App for App {
     // egui low-pass filters discrete wheel notches over several frames. Preceding each wheel
     // event with a Start phase makes egui treat it as direct (unsmoothed) input.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let dropped_files = std::mem::take(&mut raw_input.dropped_files);
+        if !dropped_files.is_empty() {
+            self.open_dropped_files(dropped_files);
+        }
         if !raw_input.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. })) {
             return;
         }
@@ -1537,6 +1748,7 @@ impl eframe::App for App {
         save_window(&self.window);
     }
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tab_shortcuts(ctx);
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::N)) {
             self.browser = None;
             self.new_tab(None, String::new(), false, 0);
@@ -1663,7 +1875,7 @@ fn save_window(w: &WindowState) {
 fn main() -> eframe::Result {
     let file = std::env::args_os().nth(1).map(PathBuf::from);
     let icon = eframe::icon_data::from_png_bytes(APP_ICON).expect("Cannot load application icon");
-    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("RustEd").with_icon(icon);
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("RustEd").with_icon(icon).with_drag_and_drop(true);
     let mut centered = true;
     if let Some(w) = load_window() {
         viewport = viewport.with_inner_size(w.size).with_maximized(w.maximized);
@@ -1716,6 +1928,104 @@ mod tests {
         app
     }
 
+    #[derive(Debug)]
+    struct TestDrop(PathBuf);
+
+    impl egui::DroppedFile for TestDrop {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|error| error.to_string())
+        }
+    }
+
+    #[test]
+    fn dropped_files_open_once_in_tabs_and_preserve_existing_edits() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text = "unsaved".into();
+        app.tabs[0].dirty = true;
+        app.browser = Some(Browser {
+            mode: BrowserMode::Open, dir: PathBuf::new(), entries: Vec::new(),
+            name: String::new(), error: None, focus_name: false,
+        });
+        let dir = std::env::temp_dir();
+        let id = format!("rusted-drop-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let first = dir.join(format!("{id}-1.txt"));
+        let second = dir.join(format!("{id}-2.txt"));
+        std::fs::write(&first, "first\r\nline").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        let mut input = egui::RawInput::default();
+        input.dropped_files = vec![std::sync::Arc::new(TestDrop(first.clone())), std::sync::Arc::new(TestDrop(second.clone()))];
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+        assert!(input.dropped_files.is_empty());
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.tabs[0].text, "unsaved");
+        assert_eq!(app.tabs[1].text, "first\nline");
+        assert_eq!(app.tabs[2].text, "second");
+        assert_eq!(app.active, 2);
+        assert!(app.browser.is_none());
+        assert_eq!(app.recent[0], second);
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+        assert_eq!(app.tabs.len(), 3);
+        app.tabs[1].text.push_str(" modified");
+        app.tabs[1].dirty = true;
+        input.dropped_files.push(std::sync::Arc::new(TestDrop(first.clone())));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.active, 1);
+        assert_eq!(app.tabs[1].text, "first\nline modified");
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
+    }
+
+    #[test]
+    fn dropped_invalid_paths_are_reported_without_hiding_successes() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let missing = std::env::temp_dir().join(format!(
+            "rusted-drop-missing-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let valid = missing.with_extension("txt");
+        std::fs::write(&valid, "valid").unwrap();
+        let mut input = egui::RawInput::default();
+        input.dropped_files = vec![
+            std::sync::Arc::new(TestDrop(missing.clone())),
+            std::sync::Arc::new(TestDrop(std::env::temp_dir())),
+            std::sync::Arc::new(TestDrop(PathBuf::new())),
+            std::sync::Arc::new(TestDrop(valid.clone())),
+        ];
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+        assert_eq!(app.tabs[app.active].text, "valid");
+        let message = app.message.as_deref().unwrap();
+        assert!(message.contains(&missing.to_string_lossy().to_string()));
+        assert!(message.contains("not a regular file"));
+        assert!(message.contains("no local path"));
+        std::fs::remove_file(valid).unwrap();
+    }
+
+    #[test]
+    fn dropped_file_replaces_empty_untitled_tab() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text.clear();
+        let path = std::env::temp_dir().join(format!(
+            "rusted-drop-empty-{}-{}.txt", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, "content").unwrap();
+        let mut input = egui::RawInput::default();
+        input.dropped_files.push(std::sync::Arc::new(TestDrop(path.clone())));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].text, "content");
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn frame(ctx: &egui::Context, app: &mut App, mut events: Vec<egui::Event>, alt: bool) -> egui::FullOutput {
         events.insert(0, egui::Event::ModifiersChanged(egui::Modifiers { alt, ..Default::default() }));
         let input = egui::RawInput {
@@ -1735,6 +2045,45 @@ mod tests {
             }),
             _ => false,
         })
+    }
+
+    fn filter_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.filter_ui(ui));
+        output.textures_delta.clear();
+        output
+    }
+
+    #[test]
+    fn find_history_arrow_is_drawn_and_history_remains_selectable() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].filter_open = true;
+        app.filter_history.push("history entry".into());
+        let output = filter_frame(&ctx, &mut app, vec![]);
+        let triangle = output.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Path(path) if path.closed && path.points.len() == 3 => Some(path),
+            _ => None,
+        }).expect("find history arrow was not painted");
+        let rect = egui::Rect::from_points(&triangle.points);
+        assert!(rect.width() > 0.0 && rect.height() > 0.0);
+        assert!(triangle.points.iter().any(|point| point.y > rect.center().y));
+        let pos = rect.center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        };
+        filter_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+        filter_frame(&ctx, &mut app, vec![button(pos, false)]);
+        let output = filter_frame(&ctx, &mut app, vec![]);
+        let pos = find_label(&output, "history entry");
+        filter_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+        filter_frame(&ctx, &mut app, vec![button(pos, false)]);
+        assert_eq!(app.tabs[0].filter_text, "history entry");
+        assert_eq!(app.tabs[0].applied.0, "history entry");
     }
 
     fn toolbar_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
@@ -1766,6 +2115,198 @@ mod tests {
         }).collect::<Vec<_>>()))
     }
 
+    fn tab_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            app.tab_bar(ui);
+            ui.separator();
+            app.editor_ui(ui);
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    fn tab_shortcut_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            app.tab_shortcuts(ui.ctx());
+            app.editor_ui(ui);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn tab_shortcuts_cycle_wrap_and_focus_active_editor() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text = "first".into();
+        app.new_tab(None, "second".into(), false, 0);
+        app.new_tab(None, "third".into(), false, 0);
+        app.tabs[1].word_wrap = true;
+        app.active = 0;
+        tab_shortcut_frame(&ctx, &mut app, vec![]);
+        let forward = || key_event(Key::Tab, Modifiers::CTRL);
+        let backward = || key_event(Key::Tab, Modifiers::CTRL | Modifiers::SHIFT);
+        tab_shortcut_frame(&ctx, &mut app, vec![forward()]);
+        assert_eq!(app.active, 1);
+        assert!(app.tabs[1].word_wrap);
+        #[allow(deprecated)]
+        let id = egui::Id::new(("editor", app.tabs[1].id));
+        assert!(ctx.memory(|memory| memory.has_focus(id)));
+        assert_eq!(app.tabs[1].text, "second");
+        tab_shortcut_frame(&ctx, &mut app, vec![forward(), forward()]);
+        assert_eq!(app.active, 0);
+        tab_shortcut_frame(&ctx, &mut app, vec![backward()]);
+        assert_eq!(app.active, 2);
+        tab_shortcut_frame(&ctx, &mut app, vec![backward(), forward()]);
+        assert_eq!(app.active, 2);
+    }
+
+    #[test]
+    fn tab_shortcuts_preserve_plain_tab_and_handle_browser_and_single_tab() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].text = "text".into();
+        tab_shortcut_frame(&ctx, &mut app, vec![]);
+        tab_shortcut_frame(&ctx, &mut app, vec![key_event(Key::Tab, Modifiers::CTRL)]);
+        assert_eq!(app.tabs[0].text, "text");
+        tab_shortcut_frame(&ctx, &mut app, vec![key_event(Key::Tab, Modifiers::NONE)]);
+        assert!(app.tabs[0].text.contains('\t'));
+        app.new_tab(None, "other".into(), false, 0);
+        app.active = 0;
+        app.browser = Some(Browser {
+            mode: BrowserMode::Open, dir: PathBuf::new(), entries: Vec::new(),
+            name: String::new(), error: None, focus_name: false,
+        });
+        tab_shortcut_frame(&ctx, &mut app, vec![key_event(Key::Tab, Modifiers::CTRL | Modifiers::SHIFT)]);
+        assert_eq!(app.active, 1);
+        assert!(app.browser.is_none());
+    }
+
+    fn tab_click(ctx: &egui::Context, app: &mut App, pos: egui::Pos2, button: egui::PointerButton) -> egui::FullOutput {
+        let event = |pressed| egui::Event::PointerButton { pos, button, pressed, modifiers: Modifiers::NONE };
+        tab_frame(ctx, app, vec![egui::Event::PointerMoved(pos), event(true)]);
+        tab_frame(ctx, app, vec![event(false)])
+    }
+
+    fn tab_context(ctx: &egui::Context, app: &mut App, tab: &str, action: &str) -> egui::FullOutput {
+        let output = tab_frame(ctx, app, vec![]);
+        let pos = find_label(&output, tab);
+        tab_click(ctx, app, pos, egui::PointerButton::Secondary);
+        let output = tab_frame(ctx, app, vec![]);
+        let pos = find_label(&output, action);
+        tab_click(ctx, app, pos, egui::PointerButton::Primary)
+    }
+
+    #[test]
+    fn tab_unsaved_indicator_tracks_edits_undo_and_save() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let path = std::env::temp_dir().join(format!(
+            "rusted-tabs-{}-{}.txt", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        app.tabs.clear();
+        app.new_tab(Some(path.clone()), "original".into(), false, 0);
+        let output = tab_frame(&ctx, &mut app, vec![]);
+        find_label(&output, path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(app.tabs[0].tooltip(), path.to_string_lossy());
+        tab_frame(&ctx, &mut app, vec![egui::Event::Text("x".into())]);
+        assert!(app.tabs[0].dirty);
+        let title = format!("{}*", path.file_name().unwrap().to_str().unwrap());
+        find_label(&tab_frame(&ctx, &mut app, vec![]), &title);
+        assert_eq!(app.tabs[0].tooltip(), format!("{} (unsaved)", path.display()));
+        app.tabs[0].tail = true;
+        assert_eq!(app.tabs[0].tooltip(), format!("Tailing {} (unsaved)", path.display()));
+        app.tabs[0].tail = false;
+        tab_frame(&ctx, &mut app, vec![key_event(Key::Z, Modifiers::COMMAND)]);
+        assert!(!app.tabs[0].dirty);
+        assert_eq!(app.tabs[0].text, "original");
+        tab_frame(&ctx, &mut app, vec![key_event(Key::Y, Modifiers::COMMAND)]);
+        assert!(app.tabs[0].dirty);
+        app.write_tab(0, path.clone());
+        assert!(!app.tabs[0].dirty);
+        assert_eq!(app.tabs[0].tooltip(), path.to_string_lossy());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tab_context_actions_target_clicked_tab() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs.clear();
+        app.new_tab(Some(PathBuf::from("first.txt")), "first".into(), false, 0);
+        app.new_tab(Some(PathBuf::from("second.txt")), "second".into(), false, 0);
+        app.new_tab(Some(PathBuf::from("third.txt")), "third".into(), false, 0);
+        app.tabs[0].dirty = true;
+        app.tabs[2].dirty = true;
+        let output = tab_context(&ctx, &mut app, "first.txt*", "Copy file path");
+        assert!(output.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "first.txt")));
+        assert_eq!(app.active, 2);
+        tab_context(&ctx, &mut app, "first.txt*", "Close all others");
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].text, "first");
+        assert!(app.tabs[0].dirty);
+        assert_eq!(app.active, 0);
+        tab_context(&ctx, &mut app, "first.txt*", "Close");
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.tabs[0].path.is_none());
+        assert!(app.tabs[0].text.is_empty());
+    }
+
+    #[test]
+    fn middle_click_closes_dirty_inactive_and_active_tabs() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs.clear();
+        app.new_tab(Some(PathBuf::from("first.txt")), "first".into(), false, 0);
+        app.new_tab(Some(PathBuf::from("second.txt")), "second".into(), false, 0);
+        app.tabs[0].dirty = true;
+        app.tabs[1].dirty = true;
+        let output = tab_frame(&ctx, &mut app, vec![]);
+        tab_click(&ctx, &mut app, find_label(&output, "first.txt*"), egui::PointerButton::Middle);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[app.active].text, "second");
+        let output = tab_frame(&ctx, &mut app, vec![]);
+        tab_click(&ctx, &mut app, find_label(&output, "second.txt*"), egui::PointerButton::Middle);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].tab_title(), "Untitled");
+    }
+
+    #[test]
+    fn untitled_tab_has_no_copy_path_and_keeps_plain_save_name() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].dirty = true;
+        assert_eq!(app.tabs[0].tab_title(), "Untitled");
+        assert_eq!(app.tabs[0].tooltip(), "Untitled (unsaved)");
+        app.save_as();
+        assert_eq!(app.browser.as_ref().unwrap().name, "Untitled");
+        app.browser = None;
+        let output = tab_context(&ctx, &mut app, "Untitled", "Copy file path");
+        assert!(!output.platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_))));
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn saved_file_named_untitled_shows_unsaved_marker() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].dirty = true;
+        app.tabs[0].path = Some(PathBuf::from("Untitled"));
+        let output = tab_frame(&ctx, &mut app, vec![]);
+        find_label(&output, "Untitled*");
+        assert_eq!(app.tabs[0].tooltip(), "Untitled (unsaved)");
+    }
+
     fn open_edit(ctx: &egui::Context, app: &mut App) -> egui::FullOutput {
         let output = toolbar_frame(ctx, app, vec![]);
         let pos = find_label(&output, "Edit");
@@ -1795,6 +2336,109 @@ mod tests {
         toolbar_frame(ctx, app, vec![egui::Event::PointerMoved(pos), button(true)]);
         toolbar_frame(ctx, app, vec![button(false)]);
         toolbar_frame(ctx, app, vec![])
+    }
+
+    #[test]
+    fn json_format_preserves_values_order_duplicates_and_escapes() {
+        let input = r#" { "z":[1e400,{},[],true,null],"a":"a \"quoted\" : [x]", "z":123456789012345678901234567890 } "#;
+        let expected = "{\n  \"z\": [\n    1e400,\n    {},\n    [],\n    true,\n    null\n  ],\n  \"a\": \"a \\\"quoted\\\" : [x]\",\n  \"z\": 123456789012345678901234567890\n}";
+        assert_eq!(format_json(input).unwrap(), expected);
+        assert_eq!(format_json(expected).unwrap(), expected);
+        assert_eq!(format_json(" [ ] ").unwrap(), "[]");
+        assert_eq!(format_json(r#""hello ☃""#).unwrap(), r#""hello ☃""#);
+        for invalid in ["", "{\"a\":}", "[1,]", "true false", "{\"a\":1}\u{a0}"] {
+            assert!(format_json(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn json_toolbar_formats_active_file_and_supports_undo_redo() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].path = Some(PathBuf::from("first.JSON"));
+        app.tabs[0].text = r#"{"x":[1,2]}"#.into();
+        app.tabs[0].filter_open = true;
+        app.tabs[0].applied = ("2".into(), false);
+        app.tabs[0].filter.applied = Some(("2".into(), false));
+        app.new_tab(Some(PathBuf::from("other.txt")), "other".into(), false, 0);
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "Format JSON")));
+        app.active = 0;
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        assert!(find_label(&output, "Tail").x < find_label(&output, "Format JSON").x);
+        click_at(&ctx, &mut app, find_label(&output, "Format JSON"));
+        let formatted = "{\n  \"x\": [\n    1,\n    2\n  ]\n}";
+        assert_eq!(app.tabs[0].text, formatted);
+        assert!(app.tabs[0].dirty);
+        assert!(app.tabs[0].filter.applied.is_none());
+        assert_eq!(app.tabs[1].text, "other");
+        app.update_filter(false);
+        assert_eq!(app.tabs[0].filter.results[0].0, 3);
+        click_edit(&ctx, &mut app, "Undo");
+        assert_eq!(app.tabs[0].text, r#"{"x":[1,2]}"#);
+        app.update_filter(false);
+        assert_eq!(app.tabs[0].filter.results[0].0, 0);
+        click_edit(&ctx, &mut app, "Redo");
+        assert_eq!(app.tabs[0].text, formatted);
+        app.update_filter(false);
+        assert_eq!(app.tabs[0].filter.results[0].0, 3);
+    }
+
+    #[test]
+    fn json_toolbar_handles_invalid_json_and_disables_during_tail_or_browser() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].path = Some(PathBuf::from("test.json"));
+        app.tabs[0].text = "{invalid}".into();
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        click_at(&ctx, &mut app, find_label(&output, "Format JSON"));
+        assert_eq!(app.tabs[0].text, "{invalid}");
+        assert!(!app.tabs[0].dirty);
+        assert!(app.message.as_deref().is_some_and(|message| message.starts_with("Cannot format JSON:")));
+        app.tabs[0].text = r#"{"x":1}"#.into();
+        app.tabs[0].tail = true;
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        click_at(&ctx, &mut app, find_label(&output, "Format JSON"));
+        assert_eq!(app.tabs[0].text, r#"{"x":1}"#);
+        app.tabs[0].tail = false;
+        app.browser = Some(Browser {
+            mode: BrowserMode::Open, dir: PathBuf::new(), entries: Vec::new(),
+            name: String::new(), error: None, focus_name: false,
+        });
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        click_at(&ctx, &mut app, find_label(&output, "Format JSON"));
+        assert_eq!(app.tabs[0].text, r#"{"x":1}"#);
+    }
+
+    #[test]
+    fn json_format_noop_preserves_redo_and_changed_format_clears_redo() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.tabs[0].path = Some(PathBuf::from("test.json"));
+        app.tabs[0].text = "{}".into();
+        toolbar_frame(&ctx, &mut app, vec![]);
+        toolbar_frame(&ctx, &mut app, vec![egui::Event::Text(" ".into())]);
+        let edited = app.tabs[0].text.clone();
+        click_edit(&ctx, &mut app, "Undo");
+        assert_eq!(app.tabs[0].text, "{}");
+        app.tabs[0].dirty = false;
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        click_at(&ctx, &mut app, find_label(&output, "Format JSON"));
+        assert!(!app.tabs[0].dirty);
+        click_edit(&ctx, &mut app, "Redo");
+        assert_eq!(app.tabs[0].text, edited);
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        click_at(&ctx, &mut app, find_label(&output, "Format JSON"));
+        assert_eq!(app.tabs[0].text, "{}");
+        click_edit(&ctx, &mut app, "Undo");
+        assert_eq!(app.tabs[0].text, edited);
+        click_edit(&ctx, &mut app, "Undo");
+        assert_eq!(app.tabs[0].text, "{}");
+        toolbar_frame(&ctx, &mut app, vec![egui::Event::Text("  ".into())]);
+        let output = toolbar_frame(&ctx, &mut app, vec![]);
+        click_at(&ctx, &mut app, find_label(&output, "Format JSON"));
+        click_edit(&ctx, &mut app, "Redo");
+        assert_eq!(app.tabs[0].text, "{}");
     }
 
     #[test]

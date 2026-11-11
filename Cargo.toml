@@ -7,6 +7,7 @@ edition = "2024"
 eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "glow", "default_fonts", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = { version = "3.7", default-features = false }
+serde_json = { version = "1.0", features = ["raw_value"] }
 
 [profile.release]
 opt-level = 3

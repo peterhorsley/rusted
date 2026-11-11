@@ -57,7 +57,14 @@ rusted.exe [file]
 ```
 
 An optional single argument is the path of a file to open; without it an empty
-editor opens.
+editor opens. Files can also be dragged from another application onto the window;
+multiple dropped files open in separate tabs.
+
+An asterisk on a file tab marks unsaved changes; pathless Untitled tabs never
+show an asterisk. Right-click a tab to close it,
+close all other tabs, or copy its file path. Middle-click also closes a tab.
+Closing a file discards unsaved changes without prompting.
+Use Ctrl+Tab and Ctrl+Shift+Tab to cycle through open tabs.
 
 The Edit menu provides undo, redo, cut, copy and paste. The About > Program
 menu shows the application version. The toolbar beneath the file tabs opens
@@ -65,6 +72,9 @@ Filter / Find and controls word wrap, hidden characters and tailing for the curr
 Use Ctrl+W, Ctrl+E and Ctrl+T respectively to toggle them.
 Enabling tail reloads the file and discards any unsaved edits; editing actions
 are disabled while tailing. Toolbar icons are embedded in the executable.
+For `.json` files, the toolbar also offers Format JSON, which formats valid JSON
+with two-space indentation. Invalid JSON is left unchanged and an error is shown
+in the status bar. Formatting is undoable and is disabled while tailing.
 
 Settings and history are stored in `%APPDATA%\rusted` (recent files and window
 position).
