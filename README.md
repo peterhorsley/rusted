@@ -97,4 +97,9 @@ TODO
 - Syntax highlighting
 - Add link to github on about dialog
 - add a "minimap" feature the same as the one in vscode.  it's a vertical bar that shows the content of the entire file in 
-- alt selection color too dark
+- linux/mac
+- installer / open with in windows?
+- check for updates?
+- ci-cd?
+- refactor to > 1 file, add detailed comments, re-do readme
+- light theme

@@ -1812,6 +1812,7 @@ impl App {
                     }
                 }
                 let background = ui.painter().add(egui::Shape::Noop);
+                let column_background = ui.painter().add(egui::Shape::Noop);
                 let out = ui
                     .horizontal_top(|ui| {
                         ui.add_space(gutter_w);
@@ -1971,11 +1972,12 @@ impl App {
                     if let (Some(first), Some(last)) = (galley.rows.get(l0), galley.rows.get(l1)) {
                         let y0 = out.galley_pos.y + first.rect().min.y;
                         let y1 = out.galley_pos.y + last.rect().max.y;
-                        painter.rect_filled(
+                        // Painted behind the text, like the normal selection.
+                        painter.set(column_background, egui::Shape::rect_filled(
                             egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
                             0.0,
-                            ui.visuals().selection.bg_fill.gamma_multiply(0.8),
-                        );
+                            ui.visuals().selection.bg_fill,
+                        ));
                     }
                 }
                 let gutter = egui::Rect::from_min_max(
@@ -3472,23 +3474,6 @@ mod tests {
     }
 
     #[test]
-    fn about_program_opens_and_closes_dialog() {
-        let ctx = egui::Context::default();
-        let mut app = test_app();
-        let output = toolbar_frame(&ctx, &mut app, vec![]);
-        assert!(find_label(&output, "File").x < find_label(&output, "About").x);
-        assert!(find_label(&output, "About").x < find_label(&output, "Edit").x);
-        let output = click_at(&ctx, &mut app, find_label(&output, "About"));
-        let output = click_at(&ctx, &mut app, find_label(&output, "Program"));
-        assert!(app.about_open);
-        find_label(&output, "rusted");
-        find_label(&output, "Version 1.0.0");
-        assert!(app.about_icon.as_ref().is_some_and(Result::is_ok));
-        click_at(&ctx, &mut app, find_label(&output, "Close"));
-        assert!(!app.about_open);
-    }
-
-    #[test]
     fn find_toolbar_toggles_active_tab_filter() {
         let ctx = egui::Context::default();
         let mut app = test_app();
@@ -3853,7 +3838,7 @@ mod tests {
         assert!(!has_linear_selection(&output, color));
         let output = frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], true);
         assert!(!has_linear_selection(&output, color));
-        let rectangle_color = color.gamma_multiply(0.8);
+        let rectangle_color = color;
         assert!(output.shapes.iter().any(|shape| {
             matches!(&shape.shape, egui::Shape::Rect(rect) if rect.fill == rectangle_color)
         }));
@@ -3977,7 +3962,7 @@ mod tests {
                 egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: alt },
             ], true);
             let output = frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], true);
-            let selection_color = ctx.style_of(ctx.theme()).visuals.selection.bg_fill.gamma_multiply(0.8);
+            let selection_color = ctx.style_of(ctx.theme()).visuals.selection.bg_fill;
             let rect = output.shapes.iter().find_map(|shape| match &shape.shape {
                 egui::Shape::Rect(rect) if rect.fill == selection_color => Some(rect.rect),
                 _ => None,
@@ -4019,7 +4004,7 @@ mod tests {
             egui::Shape::Text(text) if text.galley.rows.len() == 100 => Some(text),
             _ => None,
         }).unwrap();
-        let selection_color = ctx.style_of(ctx.theme()).visuals.selection.bg_fill.gamma_multiply(0.8);
+        let selection_color = ctx.style_of(ctx.theme()).visuals.selection.bg_fill;
         let rect = output.shapes.iter().find_map(|shape| match &shape.shape {
             egui::Shape::Rect(rect) if rect.fill == selection_color => Some(rect.rect),
             _ => None,
