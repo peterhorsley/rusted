@@ -64,6 +64,28 @@ impl HighlightColor {
         }
     }
 
+    fn label(self, light: bool) -> &'static str {
+        match (self, light) {
+            (Self::DarkGray, true) => "White",
+            (Self::DarkRed, true) => "Light Red",
+            (Self::DarkGreen, true) => "Light Green",
+            (Self::DarkBlue, true) => "Light Blue",
+            (Self::DarkPurple, true) => "Light Purple",
+            _ => self.name(),
+        }
+    }
+
+    fn themed(self, light: bool) -> Color32 {
+        match (self, light) {
+            (Self::DarkGray, true) => Color32::WHITE,
+            (Self::DarkRed, true) => Color32::from_rgb(255, 205, 205),
+            (Self::DarkGreen, true) => Color32::from_rgb(200, 240, 205),
+            (Self::DarkBlue, true) => Color32::from_rgb(200, 220, 255),
+            (Self::DarkPurple, true) => Color32::from_rgb(232, 210, 245),
+            _ => self.color(),
+        }
+    }
+
     fn color(self) -> Color32 {
         match self {
             Self::DarkGray => Color32::from_rgb(27, 27, 27),
@@ -122,7 +144,12 @@ fn replace_matches(text: &str, pattern: &str, replacement: &str, case: bool) -> 
     changed.then_some(output)
 }
 
-fn search_layout(text: &str, highlights: &SearchHighlights, selected_line: Option<usize>, hidden: bool, font: &FontId, width: f32) -> egui::text::LayoutJob {
+fn search_layout(text: &str, highlights: &SearchHighlights, selected_line: Option<usize>, hidden: bool, font: &FontId, width: f32, light: bool) -> egui::text::LayoutJob {
+    let (normal, hit, selected) = if light {
+        (Color32::from_gray(50), Color32::BLACK, Color32::from_rgb(150, 105, 0))
+    } else {
+        (Color32::from_gray(212), Color32::WHITE, Color32::YELLOW)
+    };
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = width;
     let append = |job: &mut egui::text::LayoutJob, s: &str, color| {
@@ -131,12 +158,12 @@ fn search_layout(text: &str, highlights: &SearchHighlights, selected_line: Optio
     };
     let matches_current_text = highlights.active && text == highlights.snapshot;
     if !matches_current_text && selected_line.is_none() {
-        append(&mut job, text, Color32::from_gray(212));
+        append(&mut job, text, normal);
         return job;
     }
     for (i, line) in text.split_inclusive('\n').enumerate() {
         if selected_line == Some(i) {
-            append(&mut job, line, Color32::YELLOW);
+            append(&mut job, line, selected);
             continue;
         }
         let content = line.strip_suffix('\n').unwrap_or(line);
@@ -146,15 +173,15 @@ fn search_layout(text: &str, highlights: &SearchHighlights, selected_line: Optio
                 if range.start < start {
                     continue;
                 }
-                append(&mut job, &content[start..range.start], Color32::from_gray(212));
-                append(&mut job, &content[range.clone()], Color32::WHITE);
+                append(&mut job, &content[start..range.start], normal);
+                append(&mut job, &content[range.clone()], hit);
                 start = range.end;
             }
         }
-        append(&mut job, &line[start..], Color32::from_gray(212));
+        append(&mut job, &line[start..], normal);
     }
     if text.is_empty() {
-        append(&mut job, "", Color32::from_gray(212));
+        append(&mut job, "", normal);
     }
     job
 }
@@ -653,6 +680,7 @@ struct App {
     replace_history: Vec<String>,
     toolbar_icons: Option<Result<ToolbarIcons, String>>,
     about_open: bool,
+    light_theme: bool,
     about_icon: Option<Result<egui::TextureHandle, String>>,
     editor_selection: Option<(u64, egui::text::CCursorRange)>,
     pending_edit: Option<PendingEdit>,
@@ -838,6 +866,13 @@ impl App {
                 let total = tab.text.bytes().filter(|&b| b == b'\n').count() + 1;
                 if (1..=total).contains(&line) {
                     tab.goto_line = Some(line - 1);
+                    let offset: usize = tab.text.split_inclusive('\n').take(line - 1).map(|l| l.chars().count()).sum();
+                    #[allow(deprecated)]
+                    let id = egui::Id::new(("editor", tab.id));
+                    let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(offset))));
+                    state.store(ui.ctx(), id);
+                    tab.col_sel = None;
                     tab.scroll_to_goto = Some(line - 1);
                     tab.scroll_to_highlight = false;
                     tab.scroll_to_end = false;
@@ -913,7 +948,8 @@ impl App {
     }
 
     fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let light_theme = load_light_theme();
+        cc.egui_ctx.set_visuals(theme_visuals(light_theme));
         cc.egui_ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
         let mut app = App {
             tabs: Vec::new(),
@@ -928,6 +964,7 @@ impl App {
             replace_history: Vec::new(),
             toolbar_icons: None,
             about_open: false,
+            light_theme: light_theme,
             about_icon: None,
             editor_selection: None,
             pending_edit: None,
@@ -1271,20 +1308,22 @@ impl App {
                 search = true;
             }
             ui.scope(|ui| {
-                let selected = tab.highlight_color.color();
+                let light = self.light_theme;
+                let text_color = if light { Color32::from_gray(30) } else { Color32::WHITE };
+                let selected = tab.highlight_color.themed(light);
                 let widgets = &mut ui.visuals_mut().widgets;
                 for visuals in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
                     visuals.bg_fill = selected;
                     visuals.weak_bg_fill = selected;
                 }
                 egui::ComboBox::from_id_salt(("highlight_color", tab.id))
-                    .selected_text(RichText::new(tab.highlight_color.name()).color(Color32::WHITE))
+                    .selected_text(RichText::new(tab.highlight_color.label(light)).color(text_color))
                     .show_ui(ui, |ui| {
                         for color in HighlightColor::ALL {
-                            egui::Frame::NONE.fill(color.color()).show(ui, |ui| {
+                            egui::Frame::NONE.fill(color.themed(light)).show(ui, |ui| {
                                 ui.set_min_width(105.0);
-                                ui.visuals_mut().selection.bg_fill = color.color();
-                                if ui.selectable_label(tab.highlight_color == color, RichText::new(color.name()).color(Color32::WHITE)).clicked() {
+                                ui.visuals_mut().selection.bg_fill = color.themed(light);
+                                if ui.selectable_label(tab.highlight_color == color, RichText::new(color.label(light)).color(text_color)).clicked() {
                                     tab.highlight_color = color;
                                     ui.close();
                                 }
@@ -1449,6 +1488,12 @@ impl App {
                 ui.ctx().request_repaint();
             }
             ui.menu_button("Program", |ui| {
+                if ui.button(if self.light_theme { "Dark theme" } else { "Light theme" }).clicked() {
+                    self.light_theme = !self.light_theme;
+                    ui.ctx().set_visuals(theme_visuals(self.light_theme));
+                    save_light_theme(self.light_theme);
+                    ui.close();
+                }
                 if ui.button("About").clicked() {
                     self.about_open = true;
                     ui.close();
@@ -1765,10 +1810,11 @@ impl App {
 
         let mut highlights = std::mem::take(&mut tab.search_highlights);
         let hl = tab.highlight;
+        let light = self.light_theme;
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
             let ww = if wrap { wrap_width } else { f32::INFINITY };
             let selected_line = if highlights.active && text.as_str() != highlights.snapshot { None } else { hl };
-            let job = search_layout(text.as_str(), &highlights, selected_line, hidden, &font, ww);
+            let job = search_layout(text.as_str(), &highlights, selected_line, hidden, &font, ww, light);
             ui.fonts_mut(|f| f.layout_job(job))
         };
 
@@ -1921,7 +1967,7 @@ impl App {
                                 egui::pos2(clip.left() + gutter_w, y),
                                 egui::pos2(clip.right(), y + row.rect().height()),
                             );
-                            shapes.push(egui::Shape::rect_filled(rect, 0.0, tab.highlight_color.color()));
+                            shapes.push(egui::Shape::rect_filled(rect, 0.0, tab.highlight_color.themed(light)));
                         }
                         if row.ends_with_newline {
                             line += 1;
@@ -2005,12 +2051,20 @@ impl App {
                     }
                     start += count;
                     if new_line && y + row_h >= clip.top() && y <= clip.bottom() {
+                        let target = tab.goto_line == Some(line - 1);
+                        if target {
+                            painter.rect_filled(
+                                egui::Rect::from_min_size(egui::pos2(clip.left(), y), egui::vec2(gutter_w, row_h)),
+                                0.0,
+                                Color32::from_gray(70),
+                            );
+                        }
                         painter.text(
                             egui::pos2(clip.left() + gutter_w - char_w, y),
                             egui::Align2::RIGHT_TOP,
                             line.to_string(),
                             font.clone(),
-                            if tab.goto_line == Some(line - 1) { Color32::WHITE } else { Color32::from_gray(110) },
+                            if target { Color32::WHITE } else { Color32::from_gray(110) },
                         );
                     }
                     if new_line && goto_target == Some(line - 1) {
@@ -2208,6 +2262,24 @@ fn window_file() -> Option<PathBuf> {
     recent_file().map(|f| f.with_file_name("window.txt"))
 }
 
+fn load_light_theme() -> bool {
+    recent_file()
+        .and_then(|f| std::fs::read_to_string(f.with_file_name("theme.txt")).ok())
+        .is_some_and(|s| s.trim() == "light")
+}
+
+fn save_light_theme(light: bool) {
+    let Some(f) = recent_file().map(|f| f.with_file_name("theme.txt")) else { return };
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, if light { "light" } else { "dark" });
+}
+
+fn theme_visuals(light: bool) -> egui::Visuals {
+    if light { egui::Visuals::light() } else { egui::Visuals::dark() }
+}
+
 fn load_window() -> Option<WindowState> {
     let s = std::fs::read_to_string(window_file()?).ok()?;
     let v: Vec<f32> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
@@ -2271,6 +2343,7 @@ mod tests {
             replace_history: Vec::new(),
             toolbar_icons: None,
             about_open: false,
+            light_theme: false,
             about_icon: None,
             editor_selection: None,
             pending_edit: None,
@@ -2673,7 +2746,7 @@ mod tests {
         highlights.tailed("inserted\nmodified hit\nother\nhit\nHIT", "hit", false);
         assert_eq!(highlights.lines.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![0, 0, 0, 1, 1]);
         let font = FontId::monospace(14.0);
-        let job = search_layout("inserted\nmodified hit\nother\nhit\nHIT", &highlights, None, true, &font, 60.0);
+        let job = search_layout("inserted\nmodified hit\nother\nhit\nHIT", &highlights, None, true, &font, 60.0, false);
         assert_eq!(job.wrap.max_width, 60.0);
         assert!(job.sections.iter().any(|s| s.format.color == Color32::WHITE && &job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)] == "HIT"));
         assert!(job.text.contains("modified·hit"));
@@ -2686,7 +2759,7 @@ mod tests {
         highlights.search(text, "hit", false);
         for hidden in [false, true] {
             for width in [60.0, f32::INFINITY] {
-                let job = search_layout(text, &highlights, Some(1), hidden, &FontId::monospace(14.0), width);
+                let job = search_layout(text, &highlights, Some(1), hidden, &FontId::monospace(14.0), width, false);
                 let sections: Vec<_> = job.sections.iter().map(|s| (
                     s.format.color,
                     &job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)],
@@ -2697,7 +2770,7 @@ mod tests {
             }
         }
         highlights.active = false;
-        let job = search_layout(text, &highlights, Some(1), false, &FontId::monospace(14.0), f32::INFINITY);
+        let job = search_layout(text, &highlights, Some(1), false, &FontId::monospace(14.0), f32::INFINITY, false);
         assert!(job.sections.iter().any(|s| s.format.color == Color32::YELLOW));
     }
 
