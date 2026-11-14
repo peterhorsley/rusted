@@ -102,4 +102,3 @@ TODO
 - check for updates?
 - ci-cd?
 - refactor to > 1 file, add detailed comments, re-do readme
-- light theme
