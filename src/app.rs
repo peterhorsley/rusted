@@ -226,6 +226,8 @@ pub(crate) struct App {
     pub(crate) pending_edit: Option<PendingEdit>,
     pub(crate) edit_menu_open: bool,
     pub(crate) clipboard_status: Result<bool, String>,
+    #[cfg(windows)]
+    pub(crate) launches: Option<std::sync::mpsc::Receiver<Result<crate::single_instance::Launch, String>>>,
     #[cfg(test)]
     pub(crate) clipboard_test_status: Option<Result<bool, String>>,
     pub(crate) window: WindowState,
@@ -321,6 +323,8 @@ impl eframe::App for App {
         save_window(&self.window);
     }
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        self.handle_launches();
         self.tab_shortcuts(ctx);
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::N)) {
             self.browser = None;
@@ -416,6 +420,29 @@ impl eframe::App for App {
 }
 
 impl App {
+    #[cfg(windows)]
+    pub(crate) fn handle_launches(&mut self) {
+        while let Some(result) = self.launches.as_ref().and_then(|receiver| receiver.try_recv().ok()) {
+            match result {
+                Ok(launch) => {
+                    if let Some(error) = launch.error {
+                        self.message = Some(error);
+                    } else if let Some(path) = launch.file {
+                        self.browser = None;
+                        self.open_startup_file(path, launch.tail);
+                    }
+                    if let Some(error) = launch.focus_error {
+                        self.message = Some(match self.message.take() {
+                            Some(message) => format!("{message}; {error}"),
+                            None => error,
+                        });
+                    }
+                }
+                Err(error) => self.message = Some(error),
+            }
+        }
+    }
+
     pub(crate) fn toggle_tail(&mut self) {
         let tab = &mut self.tabs[self.active];
         if tab.tail {
@@ -522,7 +549,7 @@ impl App {
         (undo, redo, selected)
     }
 
-    pub(crate) fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
+    pub(crate) fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>, tail: bool) -> Self {
         let light_theme = load_light_theme();
         cc.egui_ctx.set_visuals(theme_visuals(light_theme));
         cc.egui_ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
@@ -545,6 +572,8 @@ impl App {
             pending_edit: None,
             edit_menu_open: false,
             clipboard_status: Ok(false),
+            #[cfg(windows)]
+            launches: None,
             #[cfg(test)]
             clipboard_test_status: None,
             window: load_window().unwrap_or(WindowState {
@@ -556,12 +585,20 @@ impl App {
             status: (1, 1, 1),
         };
         if let Some(p) = file {
-            app.open_path(p);
+            app.open_startup_file(p, tail);
         }
         if app.tabs.is_empty() {
             app.new_tab(None, String::new(), false, 0);
         }
         app
+    }
+
+    pub(crate) fn open_startup_file(&mut self, path: PathBuf, tail: bool) {
+        self.message = None;
+        self.open_path(path);
+        if tail && self.message.is_none() && !self.tabs.is_empty() && !self.tabs[self.active].tail {
+            self.toggle_tail();
+        }
     }
 
     pub(crate) fn new_tab(&mut self, path: Option<PathBuf>, text: String, crlf: bool, disk_len: u64) {

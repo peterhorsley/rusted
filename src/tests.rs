@@ -27,6 +27,8 @@ fn test_app() -> App {
         pending_edit: None,
         edit_menu_open: false,
         clipboard_status: Ok(false),
+        #[cfg(windows)]
+        launches: None,
         clipboard_test_status: Some(Ok(true)),
         window: WindowState {
             pos: None,
@@ -38,6 +40,94 @@ fn test_app() -> App {
     };
     app.new_tab(None, "abcdefghij\nabcdefghij\nabcdefghij\nabcdefghij".into(), false, 0);
     app
+}
+
+#[test]
+fn startup_arguments_support_tail_and_literal_switch_filename() {
+    let parse = |args: &[&str]| crate::parse_args(args.iter().map(std::ffi::OsString::from));
+    assert_eq!(parse(&[]), Ok((None, false)));
+    assert_eq!(parse(&["file.txt"]), Ok((Some(PathBuf::from("file.txt")), false)));
+    assert_eq!(parse(&["-t", "file.txt"]), Ok((Some(PathBuf::from("file.txt")), true)));
+    assert_eq!(parse(&["file.txt", "-t"]), Ok((Some(PathBuf::from("file.txt")), true)));
+    assert_eq!(parse(&["--", "-t"]), Ok((Some(PathBuf::from("-t")), false)));
+    assert_eq!(parse(&["-t", "--", "-t"]), Ok((Some(PathBuf::from("-t")), true)));
+    assert!(parse(&["-t"]).is_err());
+    assert!(parse(&["first", "second"]).is_err());
+}
+
+#[test]
+fn startup_tail_opens_file_and_tracks_appends() {
+    let path = std::env::temp_dir().join(format!(
+        "rusted-startup-tail-{}-{}.txt", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::write(&path, "first\n").unwrap();
+    let mut app = test_app();
+    app.tabs.clear();
+    app.open_startup_file(path.clone(), false);
+    assert!(!app.tabs[0].tail);
+    app.tabs.clear();
+    app.open_startup_file(path.clone(), true);
+    assert_eq!(app.tabs[0].text, "first\n");
+    assert!(app.tabs[0].tail);
+    assert!(app.tabs[0].scroll_to_end);
+    std::fs::write(&path, "first\nsecond\n").unwrap();
+    app.update_filter(true);
+    assert_eq!(app.tabs[0].text, "first\nsecond\n");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn startup_tail_reports_missing_file_without_enabling_tail() {
+    let path = std::env::temp_dir().join(format!(
+        "rusted-startup-missing-{}-{}.txt", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let mut app = test_app();
+    app.tabs.clear();
+    app.open_startup_file(path, true);
+    assert!(!app.tabs[0].tail);
+    assert!(app.message.as_deref().is_some_and(|message| message.starts_with("Cannot reload ")));
+    app.tabs.clear();
+    app.open_startup_file(std::env::temp_dir(), true);
+    assert!(app.tabs.is_empty());
+    assert!(app.message.as_deref().is_some_and(|message| message.starts_with("Cannot open ")));
+}
+
+#[cfg(windows)]
+#[test]
+fn forwarded_launch_tails_existing_file() {
+    let path = std::env::temp_dir().join(format!(
+        "rusted-forward-{}-{}.txt", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::write(&path, "on disk").unwrap();
+    let mut app = test_app();
+    app.open_path(path.clone());
+    app.tabs[app.active].text = "unsaved".into();
+    app.tabs[app.active].dirty = true;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.launches = Some(receiver);
+    let launch = || crate::single_instance::Launch {
+        file: Some(path.clone()), tail: true, error: None, focus_error: None,
+    };
+    sender.send(Ok(launch())).unwrap();
+    app.handle_launches();
+    assert_eq!(app.tabs[app.active].text, "on disk");
+    assert!(app.tabs[app.active].tail);
+    sender.send(Ok(launch())).unwrap();
+    app.handle_launches();
+    assert!(app.tabs[app.active].tail);
+    let active = app.active;
+    let count = app.tabs.len();
+    sender.send(Ok(crate::single_instance::Launch {
+        file: None, tail: false, error: Some("-t requires a file path".into()), focus_error: None,
+    })).unwrap();
+    app.handle_launches();
+    assert_eq!(app.tabs.len(), count);
+    assert_eq!(app.active, active);
+    assert_eq!(app.message.as_deref(), Some("-t requires a file path"));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[derive(Debug)]

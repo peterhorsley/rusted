@@ -53,12 +53,19 @@ Install the **rust-analyzer** extension, open the integrated terminal
 ## Running
 
 ```powershell
-rusted.exe [file]
+rusted.exe [-t] [file]
 ```
 
 An optional single argument is the path of a file to open; without it an empty
 editor opens. Files can also be dragged from another application onto the window;
 multiple dropped files open in separate tabs.
+
+Use `rusted.exe -t path\to\file` to open a file with tailing enabled. The `-t`
+switch can also follow the file path. Tailing requires a file path; use `--`
+before the path to open a file literally named `-t` without enabling tailing.
+On Windows, launching RustEd again activates the existing window and opens the
+requested file in it. If `-t` is used on an already-open file, tailing reloads
+it and discards any unsaved edits.
 
 An asterisk on a file tab marks unsaved changes; pathless Untitled tabs never
 show an asterisk. Right-click a tab to close it,
@@ -102,3 +109,4 @@ TODO
 - check for updates?
 - ci-cd?
 - refactor to > 1 file, add detailed comments, re-do readme
+- app icon
