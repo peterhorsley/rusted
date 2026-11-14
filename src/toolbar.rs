@@ -482,7 +482,7 @@ impl App {
     }
 
     pub(crate) fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let mut select = None;
             let mut close = None;
             let mut close_others = None;
@@ -496,35 +496,33 @@ impl App {
                 } else {
                     t.tab_title()
                 };
-                ui.push_id(t.id, |ui| {
-                    let r = ui.selectable_label(self.browser.is_none() && i == self.active, title)
-                        .on_hover_text(t.tooltip());
-                    if t.tail {
-                        paint_spinner(ui, &r);
-                    }
-                    r.context_menu(|ui| {
-                        if ui.button("Close").clicked() {
-                            close = Some(i);
-                            ui.close();
-                        }
-                        if ui.button("Close all others").clicked() {
-                            close_others = Some(i);
-                            ui.close();
-                        }
-                        if ui.add_enabled(t.path.is_some(), egui::Button::new("Copy file path")).clicked() {
-                            if let Some(path) = &t.path {
-                                ui.ctx().copy_text(path.to_string_lossy().into_owned());
-                            }
-                            ui.close();
-                        }
-                    });
-                    if r.clicked() {
-                        select = Some(i);
-                    }
-                    if r.middle_clicked() {
+                let r = ui.selectable_label(self.browser.is_none() && i == self.active, title)
+                    .on_hover_text(t.tooltip());
+                if t.tail {
+                    paint_spinner(ui, &r);
+                }
+                egui::Popup::context_menu(&r).id(ui.make_persistent_id(("tab_context", t.id))).show(|ui| {
+                    if ui.button("Close").clicked() {
                         close = Some(i);
+                        ui.close();
+                    }
+                    if ui.button("Close all others").clicked() {
+                        close_others = Some(i);
+                        ui.close();
+                    }
+                    if ui.add_enabled(t.path.is_some(), egui::Button::new("Copy file path")).clicked() {
+                        if let Some(path) = &t.path {
+                            ui.ctx().copy_text(path.to_string_lossy().into_owned());
+                        }
+                        ui.close();
                     }
                 });
+                if r.clicked() {
+                    select = Some(i);
+                }
+                if r.middle_clicked() {
+                    close = Some(i);
+                }
             }
             if let Some(i) = close {
                 self.close_tab(i);

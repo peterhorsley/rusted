@@ -68,7 +68,8 @@ requested file in it. If `-t` is used on an already-open file, tailing reloads
 it and discards any unsaved edits.
 
 An asterisk on a file tab marks unsaved changes; pathless Untitled tabs never
-show an asterisk. Right-click a tab to close it,
+show an asterisk. Tabs wrap onto additional rows when they do not fit across
+the window. Right-click a tab to close it,
 close all other tabs, or copy its file path. Middle-click also closes a tab.
 Closing a file discards unsaved changes without prompting.
 Use Ctrl+Tab and Ctrl+Shift+Tab to cycle through open tabs.

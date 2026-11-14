@@ -1003,6 +1003,92 @@ fn tab_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> eg
     output
 }
 
+fn wrapped_tab_frame(ctx: &egui::Context, app: &mut App, width: f32, events: Vec<egui::Event>) -> egui::FullOutput {
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.0))),
+        events,
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(input, |ui| {
+        egui::Panel::top("tabs").show(ui, |ui| app.tab_bar(ui));
+        egui::CentralPanel::default().show(ui, |ui| app.editor_ui(ui));
+    });
+    output.textures_delta.clear();
+    output
+}
+
+#[test]
+fn tabs_wrap_and_remain_clickable_when_window_resizes() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.tabs.clear();
+    for i in 0..6 {
+        app.new_tab(Some(PathBuf::from(format!("tab-{i}.txt"))), String::new(), false, 0);
+    }
+    wrapped_tab_frame(&ctx, &mut app, 240.0, vec![]);
+    let output = wrapped_tab_frame(&ctx, &mut app, 240.0, vec![]);
+    let first = find_label(&output, "tab-0.txt");
+    let last = find_label(&output, "tab-5.txt");
+    assert!(last.y > first.y, "tabs did not wrap: {first:?}, {last:?}");
+    let fourth = find_label(&output, "tab-3.txt");
+    assert!(fourth.y > first.y && (fourth.x - first.x).abs() < 1.0,
+        "first overflowing tab did not start a new row: {first:?}, {fourth:?}");
+    assert!((find_label(&output, "tab-2.txt").y - first.y).abs() < 1.0);
+    assert!((last.y - fourth.y).abs() < 1.0);
+    for i in 0..6 {
+        let label = format!("tab-{i}.txt");
+        let (text, clip) = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => Some((text, shape.clip_rect)),
+            _ => None,
+        }).unwrap();
+        let rect = text.galley.rect.translate(text.pos.to_vec2());
+        assert!(rect.right() <= 240.0 && clip.contains_rect(rect),
+            "tab {i} is clipped: {rect:?}, {clip:?}");
+    }
+    app.active = 0;
+    let event = |pressed| egui::Event::PointerButton {
+        pos: last, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+    };
+    wrapped_tab_frame(&ctx, &mut app, 240.0, vec![egui::Event::PointerMoved(last), event(true)]);
+    wrapped_tab_frame(&ctx, &mut app, 240.0, vec![event(false)]);
+    assert_eq!(app.active, 5);
+
+    let event = |pos, button, pressed| egui::Event::PointerButton {
+        pos, button, pressed, modifiers: Modifiers::NONE,
+    };
+    wrapped_tab_frame(&ctx, &mut app, 240.0, vec![event(last, egui::PointerButton::Secondary, true)]);
+    wrapped_tab_frame(&ctx, &mut app, 240.0, vec![event(last, egui::PointerButton::Secondary, false)]);
+    let output = wrapped_tab_frame(&ctx, &mut app, 240.0, vec![]);
+    let close = find_label(&output, "Close");
+    wrapped_tab_frame(&ctx, &mut app, 240.0, vec![egui::Event::PointerMoved(close), event(close, egui::PointerButton::Primary, true)]);
+    wrapped_tab_frame(&ctx, &mut app, 240.0, vec![event(close, egui::PointerButton::Primary, false)]);
+    assert_eq!(app.tabs.len(), 5);
+    assert!(app.tabs.iter().all(|tab| tab.title() != "tab-5.txt"));
+
+    let output = wrapped_tab_frame(&ctx, &mut app, 800.0, vec![]);
+    assert!((find_label(&output, "tab-4.txt").y - find_label(&output, "tab-0.txt").y).abs() < 1.0);
+}
+
+#[test]
+fn long_tab_does_not_push_other_tabs_outside_window() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.tabs.clear();
+    let name = "a-very-long-file-name-that-does-not-fit-in-a-narrow-window.txt";
+    app.new_tab(Some(PathBuf::from(name)), String::new(), false, 0);
+    app.new_tab(Some(PathBuf::from("next.txt")), String::new(), false, 0);
+    wrapped_tab_frame(&ctx, &mut app, 240.0, vec![]);
+    let output = wrapped_tab_frame(&ctx, &mut app, 240.0, vec![]);
+    let (rect, clip) = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text == name =>
+            Some((text.galley.rect.translate(text.pos.to_vec2()), shape.clip_rect)),
+        _ => None,
+    }).unwrap();
+    assert!(rect.right() <= 240.0 && clip.contains_rect(rect), "long tab is clipped: {rect:?}, {clip:?}");
+    let next = find_label(&output, "next.txt");
+    assert!(next.x < 240.0 && next.y < 600.0, "next tab is outside the window: {next:?}");
+}
+
 fn tab_shortcut_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
     let input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
