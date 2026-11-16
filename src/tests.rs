@@ -49,8 +49,11 @@ fn startup_arguments_support_tail_and_literal_switch_filename() {
     assert_eq!(parse(&["file.txt"]), Ok((Some(PathBuf::from("file.txt")), false)));
     assert_eq!(parse(&["-t", "file.txt"]), Ok((Some(PathBuf::from("file.txt")), true)));
     assert_eq!(parse(&["file.txt", "-t"]), Ok((Some(PathBuf::from("file.txt")), true)));
-    assert_eq!(parse(&["--", "-t"]), Ok((Some(PathBuf::from("-t")), false)));
-    assert_eq!(parse(&["-t", "--", "-t"]), Ok((Some(PathBuf::from("-t")), true)));
+    assert_eq!(parse(&[r".\-t"]), Ok((Some(PathBuf::from(r".\-t")), false)));
+    assert_eq!(parse(&["-t", r".\-t"]), Ok((Some(PathBuf::from(r".\-t")), true)));
+    assert_eq!(parse(&["--"]), Ok((Some(PathBuf::from("--")), false)));
+    assert_eq!(parse(&["--", "-t"]), Ok((Some(PathBuf::from("--")), true)));
+    assert!(parse(&["--", "file.txt"]).is_err());
     assert!(parse(&["-t"]).is_err());
     assert!(parse(&["first", "second"]).is_err());
 }
@@ -753,6 +756,48 @@ fn find_label(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
         egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
         _ => None,
     }).collect::<Vec<_>>()))
+}
+
+#[test]
+fn about_dialog_shows_description_designer_and_command_line_usage() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.about_open = true;
+    toolbar_frame(&ctx, &mut app, vec![]);
+    let output = toolbar_frame(&ctx, &mut app, vec![]);
+    for label in [
+        "A lightweight text editor with search, filtering, and file tailing.",
+        "Designed by Peter Horsley",
+        "RustEd.exe [-t] [file]",
+        "file: Optional file to open.",
+        "-t: Tail the file (requires a file; may also follow it).",
+    ] {
+        find_label(&output, label);
+    }
+    let description = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("A lightweight text editor") => Some(text),
+        _ => None,
+    }).unwrap();
+    assert_eq!(description.galley.rows.len(), 1);
+}
+
+#[test]
+fn about_dialog_stays_centered_when_window_resizes() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.about_open = true;
+    for size in [egui::vec2(800.0, 600.0), egui::vec2(1000.0, 700.0)] {
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.about_ui(ui.ctx()));
+            output.textures_delta.clear();
+        }
+        let rect = ctx.memory(|memory| memory.area_rect(egui::Id::unique("about_dialog"))).unwrap();
+        assert!(rect.center().distance(egui::pos2(size.x / 2.0, size.y / 2.0)) < 1.0, "{rect:?}");
+    }
 }
 
 fn goto_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {

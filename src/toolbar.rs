@@ -402,7 +402,9 @@ impl App {
         let icon = self.about_icon.get_or_insert_with(|| load_icon(ctx, "application", APP_ICON));
         let mut close = false;
         egui::Window::new("About")
+            .id(egui::Id::unique("about_dialog"))
             .open(&mut self.about_open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
@@ -414,6 +416,13 @@ impl App {
                     ui.heading("RustEd");
                 });
                 ui.label("Version 1.0.0");
+                ui.add(egui::Label::new("A lightweight text editor with search, filtering, and file tailing.").extend());
+                ui.label("Designed by Peter Horsley");
+                ui.separator();
+                ui.label("Command-line usage:");
+                ui.label(RichText::new("RustEd.exe [-t] [file]").monospace());
+                ui.label("file: Optional file to open.");
+                ui.label("-t: Tail the file (requires a file; may also follow it).");
                 if ui.button("OK").clicked() {
                     close = true;
                 }

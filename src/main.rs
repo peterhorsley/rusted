@@ -19,11 +19,8 @@ use std::path::PathBuf;
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<(Option<PathBuf>, bool), &'static str> {
     let mut file = None;
     let mut tail = false;
-    let mut options = true;
     for arg in args {
-        if options && arg == "--" {
-            options = false;
-        } else if options && arg == "-t" {
+        if arg == "-t" {
             tail = true;
         } else if file.is_none() {
             file = Some(PathBuf::from(arg));
