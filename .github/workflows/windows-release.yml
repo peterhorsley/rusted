@@ -27,13 +27,15 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
-      - name: Publish prerelease
+      - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
           $tag = "build-$env:GITHUB_SHA"
           $exe = "target\release\RustEd.exe"
+          $version = (Get-Item -LiteralPath $exe).VersionInfo
+          $title = "RustEd v$($version.FileMajorPart).$($version.FileMinorPart).$($version.FileBuildPart)"
           $ErrorActionPreference = "Continue"
           $result = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,assets 2>&1
           $lookupExitCode = $LASTEXITCODE
@@ -49,10 +51,41 @@ jobs:
             }
             gh release upload $tag $exe --repo $env:GITHUB_REPOSITORY --clobber
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } else {
             Write-Host "Release lookup: $result"
-            gh release create $tag $exe --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --latest=false --title "Windows build $env:GITHUB_SHA" --notes "Automated Windows build for commit $env:GITHUB_SHA."
+
+            $releasedTags = @(gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --paginate --jq '.[] | select(.draft == false) | .tag_name')
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $history = @(git rev-list --first-parent $env:GITHUB_SHA)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $previous = $null
+            foreach ($commit in ($history | Select-Object -Skip 1)) {
+              if ($releasedTags -contains "build-$commit") {
+                $previous = $commit
+                break
+              }
+            }
+            $range = if ($previous) { "$previous..$env:GITHUB_SHA" } else { $env:GITHUB_SHA }
+            $commits = @(git log $range '--format=%H%x09%s')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($commits.Count -eq 0) { throw "No commits found for release $tag." }
+            $notes = @("## What's Changed", "")
+            foreach ($commit in $commits) {
+              $parts = $commit -split "`t", 2
+              if ($parts.Count -ne 2) { throw "Invalid git log output: $commit" }
+              $short = $parts[0].Substring(0, 7)
+              $notes += "- $($parts[1]) ([$short]($env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/commit/$($parts[0])))"
+            }
+            $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+            $notes | Set-Content -LiteralPath $notesPath -Encoding utf8
           }
+
+          $head = gh api "repos/$env:GITHUB_REPOSITORY/commits/main" --jq .sha
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $latest = ($head -eq $env:GITHUB_SHA).ToString().ToLowerInvariant()
+          if ($lookupExitCode -eq 0) {
+            gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --prerelease=false --latest=$latest --title $title
+          } else {
+            gh release create $tag $exe --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --latest=$latest --title $title --notes-file $notesPath
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

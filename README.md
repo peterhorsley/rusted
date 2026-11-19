@@ -68,9 +68,12 @@ Install the **rust-analyzer** extension, open the integrated terminal
 ### Automatic Windows builds
 
 Pushes to `main` run the tests and build a Windows executable using GitHub
-Actions. A successful build publishes `RustEd.exe` as a GitHub prerelease
-tagged `build-<commit SHA>`; pushes containing multiple commits build the
-latest commit. These prereleases do not replace the latest stable release.
+Actions. A successful build publishes `RustEd.exe` as a GitHub release
+tagged `build-<commit SHA>`, titled `RustEd v<major>.<minor>.<patch>`, with
+commit-based change notes since the previous published build. Numeric titles
+may repeat until a new version tag is created. Pushes containing multiple
+commits build the latest commit, and only the current `main` tip is marked
+as the latest release.
 The workflow uses the built-in `GITHUB_TOKEN` with contents write permission,
 so no personal access token is needed. GitHub Actions must be enabled and
 repository or organization policies must allow that permission.
