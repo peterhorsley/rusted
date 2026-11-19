@@ -1,0 +1,58 @@
+name: Windows release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2025
+    steps:
+      - name: Check out source and tags
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "build-$env:GITHUB_SHA"
+          $exe = "target\release\RustEd.exe"
+          $ErrorActionPreference = "Continue"
+          $result = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,assets 2>&1
+          $lookupExitCode = $LASTEXITCODE
+          $ErrorActionPreference = "Stop"
+          if ($lookupExitCode -eq 0) {
+            $release = $result | ConvertFrom-Json
+            if (-not $release.isDraft) {
+              if (-not ($release.assets | Where-Object { $_.name -ceq "RustEd.exe" })) {
+                throw "Published release $tag is missing RustEd.exe; repair it manually."
+              }
+              Write-Host "Release $tag is already published."
+              exit 0
+            }
+            gh release upload $tag $exe --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "Release lookup: $result"
+            gh release create $tag $exe --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --latest=false --title "Windows build $env:GITHUB_SHA" --notes "Automated Windows build for commit $env:GITHUB_SHA."
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

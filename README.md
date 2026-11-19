@@ -65,6 +65,21 @@ Install the **rust-analyzer** extension, open the integrated terminal
 **Tasks: Configure Default Build Task**, choose `rust: cargo build`, and add
 `"args": ["--release"]` to the task for a Ctrl+Shift+B release build.
 
+### Automatic Windows builds
+
+Pushes to `main` run the tests and build a Windows executable using GitHub
+Actions. A successful build publishes `RustEd.exe` as a GitHub prerelease
+tagged `build-<commit SHA>`; pushes containing multiple commits build the
+latest commit. These prereleases do not replace the latest stable release.
+The workflow uses the built-in `GITHUB_TOKEN` with contents write permission,
+so no personal access token is needed. GitHub Actions must be enabled and
+repository or organization policies must allow that permission.
+
+After committing and pushing the workflow to `main`, check the repository's
+Actions tab for the run and its Releases page for the executable. Standard
+GitHub-hosted runners are free for public repositories. The executable is
+unsigned, so Windows SmartScreen may warn before running it.
+
 ## Running
 
 ```powershell
@@ -115,15 +130,3 @@ in the status bar. Formatting is undoable and is disabled while tailing.
 
 Settings and history are stored in `%APPDATA%\rusted` (recent files and window
 position).
-
-TODO
-----
-- Syntax highlighting
-- Add link to github on about dialog
-- add a "minimap" feature the same as the one in vscode.  it's a vertical bar that shows the content of the entire file in 
-- linux/mac
-- installer / open with in windows?
-- check for updates?
-- ci-cd?
-- refactor to > 1 file, add detailed comments, re-do readme
-- app icon
