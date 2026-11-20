@@ -14,7 +14,12 @@ galley to `TextEdit` is not sufficient.
 
 To profile the optional local sample, run
 `cargo test --release --locked profile_large_file_editor -- --ignored --nocapture`.
-It measures headless egui frames, not GPU rendering or end-to-end UI latency.
+The benchmark checks that wheel input changes the visible gutter lines and
+reports both the input frame and the subsequent scrolled frame. It measures
+headless egui frames, not GPU rendering or end-to-end UI latency.
+To profile a different sufficiently long file, set `RUSTED_PROFILE_FILE` to
+its path before running the command. The search workload uses `response` and
+reports its match count.
 
 ## Building a Windows exe
 

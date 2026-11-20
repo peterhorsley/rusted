@@ -246,13 +246,27 @@ fn frame(ctx: &egui::Context, app: &mut App, mut events: Vec<egui::Event>, alt: 
 #[test]
 #[ignore = "manual release-mode profile using test-large-file.txt"]
 fn profile_large_file_editor() {
-    assert!(Path::new("test-large-file.txt").is_file(), "test-large-file.txt is required");
+    let path = std::env::var_os("RUSTED_PROFILE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("test-large-file.txt"));
+    assert!(path.is_file(), "{} is required", path.display());
     let start = Instant::now();
     let mut app = test_app();
-    app.open_path(PathBuf::from("test-large-file.txt"));
+    app.open_path(path.clone());
     assert!(app.message.is_none(), "{:?}", app.message);
+    eprintln!(
+        "file: {} ({} bytes on disk, {} normalized bytes)",
+        path.display(), std::fs::metadata(&path).unwrap().len(), app.tabs[app.active].text.len()
+    );
     eprintln!("open: {:?}", start.elapsed());
     let ctx = egui::Context::default();
+    ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    let first_gutter_line = |output: &egui::FullOutput| {
+        output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.pos.x < 100.0 => text.galley.job.text.parse::<usize>().ok(),
+            _ => None,
+        }).min()
+    };
     for (name, action) in [("initial", 0), ("redraw", 1), ("search", 2), ("wrap", 3), ("hidden", 4)] {
         let start = Instant::now();
         match action {
@@ -260,6 +274,8 @@ fn profile_large_file_editor() {
                 app.tabs[app.active].filter_open = true;
                 app.tabs[app.active].filter_text = "response".into();
                 app.apply_search();
+                let matches: usize = app.tabs[app.active].search_highlights.lines.iter().map(Vec::len).sum();
+                eprintln!("search matches: {matches}");
             }
             3 => app.tabs[app.active].word_wrap = true,
             4 => app.tabs[app.active].hidden_chars = true,
@@ -269,6 +285,7 @@ fn profile_large_file_editor() {
         let start = Instant::now();
         let output = frame(&ctx, &mut app, Vec::new(), false);
         eprintln!("{name} frame: {:?}", start.elapsed());
+        let before = first_gutter_line(&output).expect("no visible gutter line before wheel");
         drop(output);
         let events = vec![
             egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
@@ -291,6 +308,46 @@ fn profile_large_file_editor() {
         let output = frame(&ctx, &mut app, events, false);
         eprintln!("{name} wheel frame: {:?}", start.elapsed());
         drop(output);
+        let start = Instant::now();
+        let output = frame(&ctx, &mut app, Vec::new(), false);
+        eprintln!("{name} scrolled frame: {:?}", start.elapsed());
+        let after = first_gutter_line(&output).expect("no visible gutter line after wheel");
+        assert!(after > before, "{name} wheel did not advance: {before} -> {after}");
+        eprintln!("{name} wheel: gutter line {before} -> {after}");
+        drop(output);
+    }
+}
+
+#[test]
+fn document_wide_selection_copy_paste_and_undo_with_view_options() {
+    for wrap in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let original = (0..100)
+            .map(|line| format!("{line:03} hit café \t{}\n", "long text ".repeat(10)))
+            .collect::<String>();
+        app.tabs[0].text = original.clone();
+        app.tabs[0].saved_text = original.clone();
+        app.tabs[0].word_wrap = wrap;
+        app.tabs[0].hidden_chars = true;
+        app.tabs[0].filter_text = "hit".into();
+        app.apply_search();
+        frame(&ctx, &mut app, vec![], false);
+
+        let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        frame(&ctx, &mut app, vec![key_event(Key::Home, ctrl)], false);
+        frame(&ctx, &mut app, vec![key_event(Key::End, ctrl | Modifiers::SHIFT)], false);
+        let output = frame(&ctx, &mut app, vec![egui::Event::Copy], false);
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == &original)
+        }), "copy must include off-screen lines, wrap={wrap}: {:?}", output.platform_output.commands);
+
+        frame(&ctx, &mut app, vec![egui::Event::Paste("replacement 😀\n".into())], false);
+        assert_eq!(app.tabs[0].text, "replacement 😀\n", "wrap={wrap}");
+        assert!(app.tabs[0].dirty);
+        frame(&ctx, &mut app, vec![key_event(Key::Z, Modifiers::COMMAND)], false);
+        assert_eq!(app.tabs[0].text, original, "undo must restore the whole document, wrap={wrap}");
+        assert!(!app.tabs[0].dirty);
     }
 }
 
