@@ -2,6 +2,45 @@ use crate::app::*;
 use crate::search::*;
 use crate::toolbar::*;
 use eframe::egui::{self, Color32, FontId, Key, Modifiers, TextEdit};
+use std::sync::{Arc, Weak};
+
+struct RowInfo {
+    line: usize,
+    start: usize,
+    paragraph_start: usize,
+    new_line: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct RowIndex {
+    galley: Weak<egui::Galley>,
+    rows: Vec<RowInfo>,
+}
+
+impl RowIndex {
+    fn update(&mut self, galley: &Arc<egui::Galley>) {
+        if self.galley.upgrade().is_some_and(|old| Arc::ptr_eq(&old, galley)) {
+            return;
+        }
+        self.rows.clear();
+        let (mut line, mut start, mut paragraph_start, mut new_line) = (0, 0, 0, true);
+        for row in &galley.rows {
+            if new_line {
+                paragraph_start = start;
+            }
+            self.rows.push(RowInfo { line, start, paragraph_start, new_line });
+            start += usize::from(row.char_count_including_newline());
+            new_line = row.ends_with_newline;
+            line += usize::from(new_line);
+        }
+        self.galley = Arc::downgrade(galley);
+    }
+
+    fn row_for_line(&self, line: usize) -> Option<usize> {
+        let index = self.rows.partition_point(|row| row.line < line);
+        self.rows.get(index).filter(|row| row.line == line).map(|_| index)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ColSel {
@@ -223,7 +262,7 @@ impl App {
             let galley = layouter(ui, &tab.text, f32::INFINITY);
             column_keys(ui.ctx(), tab, &galley);
         }
-        let mut scroll_to = std::mem::take(&mut tab.scroll_to_highlight);
+        let scroll_to = std::mem::take(&mut tab.scroll_to_highlight);
         let mut goto_target = tab.scroll_to_goto.take();
         let scroll_area = egui::ScrollArea::both()
             .id_salt(("scroll", tab.id))
@@ -347,13 +386,22 @@ impl App {
                 }
 
                 let galley = &out.galley;
+                tab.row_index.update(galley);
+                let first_visible = galley.rows.partition_point(|row| {
+                    out.galley_pos.y + row.rect().max.y < clip.top()
+                });
+                let end_visible = galley.rows.partition_point(|row| {
+                    out.galley_pos.y + row.rect().min.y <= clip.bottom()
+                });
+                let visible = first_visible..end_visible.max(first_visible);
                 let painter = ui.painter();
                 if tab.highlight_color != HighlightColor::DarkGray
                     && highlights.active && tab.text == highlights.snapshot
                 {
-                    let mut line = 0usize;
                     let mut shapes = Vec::new();
-                    for row in &galley.rows {
+                    for ri in visible.clone() {
+                        let row = &galley.rows[ri];
+                        let line = tab.row_index.rows[ri].line;
                         let y = out.galley_pos.y + row.rect().min.y;
                         if !highlights.lines.get(line).is_none_or(Vec::is_empty)
                             && y + row.rect().height() >= clip.top() && y <= clip.bottom()
@@ -364,16 +412,13 @@ impl App {
                             );
                             shapes.push(egui::Shape::rect_filled(rect, 0.0, tab.highlight_color.themed(light)));
                         }
-                        if row.ends_with_newline {
-                            line += 1;
-                        }
                     }
                     painter.set(background, egui::Shape::Vec(shapes));
                 }
                 if hidden {
                     let marker_painter = painter.with_clip_rect(out.text_clip_rect.intersect(clip));
                     let stroke = egui::Stroke::new(1.0, Color32::from_gray(140));
-                    for row in &galley.rows {
+                    for row in &galley.rows[visible.clone()] {
                         let y = out.galley_pos.y + row.rect().center().y;
                         if y < clip.top() || y > clip.bottom() {
                             continue;
@@ -427,25 +472,33 @@ impl App {
                 );
                 painter.rect_filled(gutter, 0.0, ui.visuals().extreme_bg_color);
                 let cursor_idx = out.cursor_range.map(|r| usize::from(r.primary.index));
-                let mut line = 1usize;
-                let mut new_line = true;
-                let mut start = 0usize;
-                let mut para_start = 0usize;
-                let last = galley.rows.len().saturating_sub(1);
-                for (ri, row) in galley.rows.iter().enumerate() {
-                    let r = row.rect();
-                    let y = out.galley_pos.y + r.min.y;
-                    if new_line {
-                        para_start = start;
+                if let Some(ci) = cursor_idx {
+                    let ri = tab.row_index.rows.partition_point(|row| row.start <= ci).saturating_sub(1);
+                    if let Some(info) = tab.row_index.rows.get(ri) {
+                        status = (total, info.line + 1, ci.saturating_sub(info.paragraph_start) + 1);
                     }
-                    let count = usize::from(row.char_count_including_newline());
-                    if let Some(ci) = cursor_idx {
-                        if ci >= start && (ci < start + count || ri == last) {
-                            status = (total, line, ci - para_start + 1);
+                }
+                if let Some(target) = goto_target.take() {
+                    if let Some(ri) = tab.row_index.row_for_line(target) {
+                        let y = out.galley_pos.y + galley.rows[ri].rect().min.y;
+                        if y < clip.top() || y + row_h > clip.bottom() {
+                            ui.scroll_with_delta(egui::vec2(0.0, clip.center().y - (y + row_h / 2.0)));
                         }
                     }
-                    start += count;
-                    if new_line && y + row_h >= clip.top() && y <= clip.bottom() {
+                }
+                if scroll_to {
+                    if let Some(ri) = hl.and_then(|line| tab.row_index.row_for_line(line)) {
+                        let y = out.galley_pos.y + galley.rows[ri].rect().min.y;
+                        ui.scroll_with_delta(egui::vec2(0.0, clip.center().y - (y + row_h / 2.0)));
+                    }
+                }
+                for ri in visible {
+                    let row = &galley.rows[ri];
+                    let info = &tab.row_index.rows[ri];
+                    let line = info.line + 1;
+                    let r = row.rect();
+                    let y = out.galley_pos.y + r.min.y;
+                    if info.new_line && y + row_h >= clip.top() && y <= clip.bottom() {
                         let target = tab.goto_line == Some(line - 1);
                         if target {
                             painter.rect_filled(
@@ -462,12 +515,6 @@ impl App {
                             if target { Color32::WHITE } else { Color32::from_gray(110) },
                         );
                     }
-                    if new_line && goto_target == Some(line - 1) {
-                        if y < clip.top() || y + row_h > clip.bottom() {
-                            ui.scroll_with_delta(egui::vec2(0.0, clip.center().y - (y + row_h / 2.0)));
-                        }
-                        goto_target = None;
-                    }
                     if hidden && row.ends_with_newline && y + row_h >= clip.top() && y <= clip.bottom() {
                         painter.text(
                             egui::pos2(out.galley_pos.x + r.max.x, y),
@@ -476,22 +523,6 @@ impl App {
                             font.clone(),
                             Color32::from_gray(90),
                         );
-                    }
-                    if let Some(h) = hl {
-                        if line - 1 == h {
-                            let rect = egui::Rect::from_min_size(
-                                egui::pos2(clip.left() + gutter_w, y),
-                                egui::vec2(clip.width() - gutter_w, row_h),
-                            );
-                            if scroll_to {
-                                ui.scroll_with_delta(egui::vec2(0.0, clip.center().y - rect.center().y));
-                                scroll_to = false;
-                            }
-                        }
-                    }
-                    new_line = row.ends_with_newline;
-                    if new_line {
-                        line += 1;
                     }
                 }
                 if out.response.changed() {

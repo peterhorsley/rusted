@@ -243,6 +243,57 @@ fn frame(ctx: &egui::Context, app: &mut App, mut events: Vec<egui::Event>, alt: 
     output
 }
 
+#[test]
+#[ignore = "manual release-mode profile using test-large-file.txt"]
+fn profile_large_file_editor() {
+    assert!(Path::new("test-large-file.txt").is_file(), "test-large-file.txt is required");
+    let start = Instant::now();
+    let mut app = test_app();
+    app.open_path(PathBuf::from("test-large-file.txt"));
+    assert!(app.message.is_none(), "{:?}", app.message);
+    eprintln!("open: {:?}", start.elapsed());
+    let ctx = egui::Context::default();
+    for (name, action) in [("initial", 0), ("redraw", 1), ("search", 2), ("wrap", 3), ("hidden", 4)] {
+        let start = Instant::now();
+        match action {
+            2 => {
+                app.tabs[app.active].filter_open = true;
+                app.tabs[app.active].filter_text = "response".into();
+                app.apply_search();
+            }
+            3 => app.tabs[app.active].word_wrap = true,
+            4 => app.tabs[app.active].hidden_chars = true,
+            _ => {}
+        }
+        eprintln!("{name} setup: {:?}", start.elapsed());
+        let start = Instant::now();
+        let output = frame(&ctx, &mut app, Vec::new(), false);
+        eprintln!("{name} frame: {:?}", start.elapsed());
+        drop(output);
+        let events = vec![
+            egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::Vec2::ZERO,
+                phase: egui::TouchPhase::Start,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -180.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+        let start = Instant::now();
+        let output = frame(&ctx, &mut app, events, false);
+        eprintln!("{name} wheel frame: {:?}", start.elapsed());
+        drop(output);
+    }
+}
+
 fn has_linear_selection(output: &egui::FullOutput, color: Color32) -> bool {
     output.shapes.iter().any(|shape| match &shape.shape {
         egui::Shape::Text(text) => text.galley.rows.iter().any(|row| {
@@ -703,6 +754,8 @@ fn search_highlighting_tracks_color_searches_and_editing() {
 fn search_highlighting_handles_unicode_wrap_and_tail_updates() {
     assert_eq!(match_ranges("İx İX", "i\u{307}x", false), vec![0..3, 4..7]);
     assert_eq!(match_ranges("Alpha alpha", "alpha", true), vec![6..11]);
+    assert_eq!(match_ranges("RESPONSE response", "response", false), vec![0..8, 9..17]);
+    assert_eq!(match_ranges("abc", "é", false), Vec::new());
     let mut highlights = SearchHighlights::default();
     highlights.search("hit\nother\nhit", "hit", false);
     highlights.edited("inserted\nhit\nother\nhit");
@@ -716,6 +769,77 @@ fn search_highlighting_handles_unicode_wrap_and_tail_updates() {
     assert_eq!(job.wrap.max_width, 60.0);
     assert!(job.sections.iter().any(|s| s.format.color == Color32::WHITE && &job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)] == "HIT"));
     assert!(job.text.contains("modified·hit"));
+}
+
+#[test]
+fn viewport_decorations_and_status_follow_deep_wrapped_navigation() {
+    for wrap in [false, true] {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+        let mut app = test_app();
+        let line = format!("é{}\n", "a".repeat(120));
+        app.tabs[0].text = line.repeat(1000);
+        app.tabs[0].word_wrap = wrap;
+        app.tabs[0].hidden_chars = true;
+        goto_frame(&ctx, &mut app, vec![]);
+        goto_frame(&ctx, &mut app, vec![]);
+        #[allow(deprecated)]
+        let id = egui::Id::new(("editor", app.tabs[0].id));
+        app.open_goto();
+        app.tabs[0].goto_text = "901".into();
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        goto_click(&ctx, &mut app, find_label(&output, "Go"));
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        assert!(output.shapes.iter().any(|shape| matches!(
+            &shape.shape, egui::Shape::Text(text) if text.galley.job.text == "901"
+        )), "target gutter line must be visible (wrap={wrap})");
+        let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(900 * 122 + 2),
+        )));
+        state.store(&ctx, id);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        goto_frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.status, (1001, 901, 3));
+    }
+}
+
+#[test]
+fn viewport_gutter_tracks_mouse_wheel_scroll() {
+    let ctx = egui::Context::default();
+    ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    let mut app = test_app();
+    app.tabs[0].text = (0..1000).map(|i| format!("row {i:04}\n")).collect();
+    goto_frame(&ctx, &mut app, vec![]);
+    let text_y = |output: &egui::FullOutput| {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text.starts_with("row 0000") => Some(text.pos.y),
+            _ => None,
+        }).unwrap()
+    };
+    let before = text_y(&goto_frame(&ctx, &mut app, vec![]));
+    goto_frame(&ctx, &mut app, vec![
+        egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::Vec2::ZERO,
+            phase: egui::TouchPhase::Start,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -180.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    let output = goto_frame(&ctx, &mut app, vec![]);
+    assert!(text_y(&output) < before);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text == "20"
+    )));
 }
 
 #[test]

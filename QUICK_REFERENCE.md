@@ -1,5 +1,7 @@
 # RustEd Large File Performance - Quick Reference
 
+> **Superseded:** This report contains unmeasured timings and an incorrect viewport-only `TextEdit` proposal. See the large-file performance note in [README.md](README.md).
+
 ## TL;DR
 
 **Current**: 10MB file takes 2-5s to load, search takes 2-10s

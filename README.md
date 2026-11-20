@@ -2,6 +2,20 @@
 
 A minimal, fast, cross-platform GUI text editor written in Rust (egui/eframe).
 
+## Large-file performance
+
+The editor still lays out the entire document with egui's `TextEdit`. Only
+gutter, highlight background and hidden-character marker painting are limited
+to visible rows. Opening, wrapping and highlighting large files can therefore
+block the UI, and responsive editing and scrolling of 100 MB files is not yet
+supported. A virtualized editor needs to retain correct full-document editing,
+selection, navigation and wrapped-line scroll geometry; returning a partial
+galley to `TextEdit` is not sufficient.
+
+To profile the optional local sample, run
+`cargo test --release --locked profile_large_file_editor -- --ignored --nocapture`.
+It measures headless egui frames, not GPU rendering or end-to-end UI latency.
+
 ## Building a Windows exe
 
 ### Prerequisites

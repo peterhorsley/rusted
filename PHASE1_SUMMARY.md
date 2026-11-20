@@ -1,5 +1,7 @@
 # Phase 1 Optimization Summary - COMPLETE ✓
 
+> **Superseded:** This report contains unmeasured timings and an incorrect viewport-only `TextEdit` proposal. See the large-file performance note in [README.md](README.md).
+
 ## What Was Done
 
 ### 1. Memory Allocation Optimization ✓

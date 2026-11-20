@@ -1,5 +1,7 @@
 # RustEd Large File Support - Performance Analysis & Recommendations
 
+> **Superseded:** This report contains unmeasured timings and an incorrect viewport-only `TextEdit` proposal. See the large-file performance note in [README.md](README.md).
+
 ## Executive Summary
 
 Your 10MB test file loads with noticeable lag (2-5 seconds), searches take several seconds, and toggling features causes UI freezes. **The core issue is not egui but the full-file processing architecture.** Supporting 100MB files is achievable with Rust - the design can be optimized dramatically without replacing egui.

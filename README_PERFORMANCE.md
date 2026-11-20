@@ -1,5 +1,7 @@
 # RustEd Performance Profiling & Optimization - Executive Summary
 
+> **Superseded:** This report contains unmeasured timings and an incorrect viewport-only `TextEdit` proposal. See the large-file performance note in [README.md](README.md).
+
 ## Question
 Can RustEd support loading 100MB+ text files smoothly? Is egui a hard limitation?
 

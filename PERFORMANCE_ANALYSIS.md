@@ -1,5 +1,7 @@
 # RustEd Performance Analysis: 10MB+ File Support
 
+> **Superseded:** This report contains unmeasured timings and an incorrect viewport-only `TextEdit` proposal. See the large-file performance note in [README.md](README.md).
+
 ## Current Architecture Overview
 
 RustEd is a Rust text editor built with egui. The app stores the entire file contents as a single `String` in memory and renders it using egui's `TextEdit::multiline()` with custom layouting.

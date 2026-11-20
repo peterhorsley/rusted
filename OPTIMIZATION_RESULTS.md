@@ -1,5 +1,7 @@
 # RustEd Performance Optimization: Initial Phase Complete
 
+> **Superseded:** This report contains unmeasured timings and an incorrect viewport-only `TextEdit` proposal. See the large-file performance note in [README.md](README.md).
+
 ## Changes Made
 
 ### 1. **String Allocation Optimization in search_layout()** ✓

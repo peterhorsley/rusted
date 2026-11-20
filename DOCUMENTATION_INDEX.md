@@ -1,5 +1,7 @@
 # RustEd Performance Analysis & Optimization - Complete Report Index
 
+> **Superseded:** This report contains unmeasured timings and an incorrect viewport-only `TextEdit` proposal. See the large-file performance note in [README.md](README.md).
+
 ## 📋 Document Guide
 
 ### Start Here

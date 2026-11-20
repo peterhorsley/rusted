@@ -53,8 +53,7 @@ pub(crate) struct Tab {
     pub(crate) hidden_chars: bool,
     pub(crate) tail: bool,
     pub(crate) scroll_to_end: bool,
-    // Viewport tracking for large file optimization
-    pub(crate) viewport_visible_lines: usize,
+    pub(crate) row_index: RowIndex,
 }
 
 impl Tab {
@@ -634,7 +633,7 @@ impl App {
             scroll_to_end: false,
             col_sel: None,
             col_drag: false,
-            viewport_visible_lines: 0,
+            row_index: RowIndex::default(),
         });
         self.next_id += 1;
         self.active = self.tabs.len() - 1;

@@ -1,5 +1,7 @@
 # RustEd Optimization Strategy - Implementation Plan
 
+> **Superseded:** This report contains unmeasured timings and an incorrect viewport-only `TextEdit` proposal. See the large-file performance note in [README.md](README.md).
+
 ## Goal
 Support 100MB+ text files without excessive lag. Target: < 500ms load time, smooth UI for search/wrap/nav.
 
