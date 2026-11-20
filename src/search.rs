@@ -105,9 +105,9 @@ pub(crate) fn replace_matches(text: &str, pattern: &str, replacement: &str, case
 
 pub(crate) fn search_layout(text: &str, highlights: &SearchHighlights, selected_line: Option<usize>, hidden: bool, font: &FontId, width: f32, light: bool) -> egui::text::LayoutJob {
     let (normal, hit, selected) = if light {
-        (Color32::from_gray(50), Color32::BLACK, Color32::from_rgb(150, 105, 0))
+        (Color32::from_gray(50), Color32::BLACK, Color32::from_rgb(0, 38, 255))
     } else {
-        (Color32::from_gray(212), Color32::WHITE, Color32::YELLOW)
+        (Color32::from_gray(212), Color32::WHITE, Color32::from_rgb(0, 255, 255))
     };
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = width;
