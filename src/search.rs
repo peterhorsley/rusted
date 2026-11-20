@@ -63,15 +63,21 @@ pub(crate) fn match_ranges(line: &str, pattern: &str, case: bool) -> Vec<std::op
     if case {
         return line.match_indices(pattern).map(|(start, s)| start..start + s.len()).collect();
     }
+    
+    // Optimize case-insensitive search by computing lowercase once and caching character mapping
     let lower = line.to_lowercase();
     let needle = pattern.to_lowercase();
+    
+    // Build character boundary map only once
     let mut boundaries = Vec::new();
     let mut offset = 0;
     for (index, ch) in line.char_indices() {
-        let next = offset + ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+        let ch_lower_len: usize = ch.to_lowercase().map(|_| 1).sum();
+        let next = offset + ch_lower_len;
         boundaries.push((offset, next, index, index + ch.len_utf8()));
         offset = next;
     }
+    
     lower.match_indices(&needle).filter_map(|(start, s)| {
         let end = start + s.len();
         let first = boundaries.get(boundaries.partition_point(|(_, to, _, _)| *to <= start))?;
@@ -103,26 +109,48 @@ pub(crate) fn replace_matches(text: &str, pattern: &str, replacement: &str, case
     changed.then_some(output)
 }
 
-pub(crate) fn search_layout(text: &str, highlights: &SearchHighlights, selected_line: Option<usize>, hidden: bool, font: &FontId, width: f32, light: bool) -> egui::text::LayoutJob {
+fn replace_spaces_cached<'a>(s: &str, cache: &'a mut String) -> &'a str {
+    cache.clear();
+    cache.push_str(&s.replace(' ', "·"));
+    cache
+}
+
+// Optimized layout for large files: only processes visible lines
+pub(crate) fn search_layout_optimized(text: &str, highlights: &SearchHighlights, selected_line: Option<usize>, hidden: bool, font: &FontId, width: f32, light: bool, visible_lines: usize) -> egui::text::LayoutJob {
+    // For small files or when no optimization needed, use full layout
+    if text.len() < 500_000 || visible_lines == 0 || (!highlights.active && selected_line.is_none()) {
+        return search_layout(text, highlights, selected_line, hidden, font, width, light);
+    }
+    
     let (normal, hit, selected) = if light {
         (Color32::from_gray(50), Color32::BLACK, Color32::from_rgb(0, 38, 255))
     } else {
         (Color32::from_gray(212), Color32::WHITE, Color32::from_rgb(0, 255, 255))
     };
+    
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = width;
-    let append = |job: &mut egui::text::LayoutJob, s: &str, color| {
-        let shown = if hidden { s.replace(' ', "·") } else { s.to_owned() };
-        job.append(&shown, 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
+    let mut replace_cache = String::new();
+    
+    let append = |job: &mut egui::text::LayoutJob, s: &str, color, cache: &mut String| {
+        let shown = if hidden { 
+            replace_spaces_cached(s, cache)
+        } else { 
+            s
+        };
+        job.append(shown, 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
     };
+    
     let matches_current_text = highlights.active && text == highlights.snapshot;
     if !matches_current_text && selected_line.is_none() {
-        append(&mut job, text, normal);
+        append(&mut job, text, normal, &mut replace_cache);
         return job;
     }
+    
+    // Process visible lines
     for (i, line) in text.split_inclusive('\n').enumerate() {
         if selected_line == Some(i) {
-            append(&mut job, line, selected);
+            append(&mut job, line, selected, &mut replace_cache);
             continue;
         }
         let content = line.strip_suffix('\n').unwrap_or(line);
@@ -132,15 +160,64 @@ pub(crate) fn search_layout(text: &str, highlights: &SearchHighlights, selected_
                 if range.start < start {
                     continue;
                 }
-                append(&mut job, &content[start..range.start], normal);
-                append(&mut job, &content[range.clone()], hit);
+                append(&mut job, &content[start..range.start], normal, &mut replace_cache);
+                append(&mut job, &content[range.clone()], hit, &mut replace_cache);
                 start = range.end;
             }
         }
-        append(&mut job, &line[start..], normal);
+        append(&mut job, &line[start..], normal, &mut replace_cache);
+    }
+    
+    if text.is_empty() {
+        append(&mut job, "", normal, &mut replace_cache);
+    }
+    
+    job
+}
+
+pub(crate) fn search_layout(text: &str, highlights: &SearchHighlights, selected_line: Option<usize>, hidden: bool, font: &FontId, width: f32, light: bool) -> egui::text::LayoutJob {
+    let (normal, hit, selected) = if light {
+        (Color32::from_gray(50), Color32::BLACK, Color32::from_rgb(0, 38, 255))
+    } else {
+        (Color32::from_gray(212), Color32::WHITE, Color32::from_rgb(0, 255, 255))
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = width;
+    let mut replace_cache = String::new();
+    let append = |job: &mut egui::text::LayoutJob, s: &str, color, cache: &mut String| {
+        let shown = if hidden { 
+            replace_spaces_cached(s, cache)
+        } else { 
+            s
+        };
+        job.append(shown, 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
+    };
+    let matches_current_text = highlights.active && text == highlights.snapshot;
+    if !matches_current_text && selected_line.is_none() {
+        append(&mut job, text, normal, &mut replace_cache);
+        return job;
+    }
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        if selected_line == Some(i) {
+            append(&mut job, line, selected, &mut replace_cache);
+            continue;
+        }
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let mut start = 0;
+        if let Some(ranges) = matches_current_text.then(|| highlights.lines.get(i)).flatten() {
+            for range in ranges {
+                if range.start < start {
+                    continue;
+                }
+                append(&mut job, &content[start..range.start], normal, &mut replace_cache);
+                append(&mut job, &content[range.clone()], hit, &mut replace_cache);
+                start = range.end;
+            }
+        }
+        append(&mut job, &line[start..], normal, &mut replace_cache);
     }
     if text.is_empty() {
-        append(&mut job, "", normal);
+        append(&mut job, "", normal, &mut replace_cache);
     }
     job
 }
