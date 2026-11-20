@@ -103,6 +103,19 @@ pub(crate) fn toolbar_button(icon: &egui::TextureHandle, label: &str, selected: 
     egui::Button::image_and_text(image, label.to_owned()).selected(selected)
 }
 
+fn filter_result_label(line: usize, text: &str, terminated: bool, hidden: bool) -> String {
+    let text = if hidden {
+        let mut shown = text.replace(' ', "·").replace('\t', "───→");
+        if terminated {
+            shown.push('¶');
+        }
+        shown
+    } else {
+        text.to_owned()
+    };
+    format!("{:>6}  {}", line + 1, text)
+}
+
 // "Live" indicator at the left edge of a tab label: a solid dot with a ring that expands and fades.
 pub(crate) fn paint_spinner(ui: &egui::Ui, label: &egui::Response) {
     let size = egui::TextStyle::Body.resolve(ui.style()).size * 0.8;
@@ -255,33 +268,76 @@ impl App {
         }
         let mut jump = None;
         let results = &tab.filter.results;
+        let wrap = tab.word_wrap;
+        let hidden = tab.hidden_chars;
         let mut selected = tab.filter.selected;
-        egui::ScrollArea::both()
+        let mut draw_rows = |ui: &mut egui::Ui, range: std::ops::Range<usize>| {
+            ui.style_mut().wrap_mode = Some(if wrap { egui::TextWrapMode::Wrap } else { egui::TextWrapMode::Extend });
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                for i in range {
+                    let (line, text, terminated) = &results[i];
+                    let label = RichText::new(filter_result_label(*line, text, *terminated, hidden)).font(font.clone());
+                    let r = ui.selectable_label(selected == Some(i), label);
+                    if r.clicked() {
+                        selected = Some(i);
+                    }
+                    if r.double_clicked() {
+                        selected = Some(i);
+                        jump = Some(*line);
+                    }
+                }
+            });
+        };
+        let scroll = if wrap {
+            egui::ScrollArea::vertical().horizontal_scroll_offset(0.0)
+        } else {
+            egui::ScrollArea::both()
+        }
             .id_salt(("filter_results", tab.id))
             .auto_shrink([false, false])
-            .stick_to_bottom(tab.tail)
-            .show_rows(
-            ui,
-            row_h,
-            results.len(),
-            |ui, range| {
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                    for i in range {
-                        let (line, text) = &results[i];
-                        let label = RichText::new(format!("{:>6}  {}", line + 1, text)).font(font.clone());
-                        let r = ui.selectable_label(selected == Some(i), label);
-                        if r.clicked() {
-                            selected = Some(i);
-                        }
-                        if r.double_clicked() {
-                            selected = Some(i);
-                            jump = Some(*line);
-                        }
-                    }
+            .stick_to_bottom(tab.tail);
+        if wrap {
+            scroll.show_viewport(ui, |ui, viewport| {
+                let width = ui.available_width();
+                let padding = ui.spacing().button_padding;
+                let spacing = ui.spacing().item_spacing.y;
+                let min_height = ui.spacing().interact_size.y;
+                let pixels_per_point = ui.ctx().pixels_per_point();
+                let cache = tab.filter.wrap_cache.get_or_insert_with(|| FilterWrapCache {
+                    width, font: font.clone(), hidden, padding, spacing, min_height, pixels_per_point, offsets: vec![0.0],
                 });
-            },
-        );
+                if cache.width != width || cache.font != font || cache.hidden != hidden
+                    || cache.padding != padding || cache.spacing != spacing || cache.min_height != min_height
+                    || cache.pixels_per_point != pixels_per_point
+                {
+                    *cache = FilterWrapCache {
+                        width, font: font.clone(), hidden, padding, spacing, min_height, pixels_per_point, offsets: vec![0.0],
+                    };
+                }
+                for (line, text, terminated) in &results[cache.offsets.len() - 1..] {
+                    let label = filter_result_label(*line, text, *terminated, hidden);
+                    let galley = ui.fonts_mut(|fonts| fonts.layout(
+                        label, font.clone(), Color32::WHITE, (width - 2.0 * padding.x).max(0.0),
+                    ));
+                    let height = (galley.size().y + 2.0 * padding.y).max(min_height) + spacing;
+                    cache.offsets.push(cache.offsets.last().copied().expect("filter offsets start at zero") + height);
+                }
+                let offsets = &cache.offsets;
+                ui.set_height((offsets.last().copied().expect("filter offsets start at zero") - spacing).max(0.0));
+                let start = offsets.partition_point(|offset| *offset <= viewport.min.y).saturating_sub(1).min(results.len());
+                let end = (offsets.partition_point(|offset| *offset < viewport.max.y) + 1).min(results.len());
+                let rect = egui::Rect::from_x_y_ranges(
+                    ui.max_rect().x_range(),
+                    (ui.max_rect().top() + offsets[start])..=(ui.max_rect().top() + offsets[end]),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    ui.skip_ahead_auto_ids(start);
+                    draw_rows(ui, start..end);
+                });
+            });
+        } else {
+            scroll.show_rows(ui, row_h, results.len(), &mut draw_rows);
+        }
         tab.filter.selected = selected;
         if let Some(line) = jump {
             tab.highlight = Some(line);

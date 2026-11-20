@@ -58,6 +58,20 @@ at runtime.
 If the build fails with "Access is denied" removing `RustEd.exe`, close any
 running copy of the editor first.
 
+### Running tests
+
+From the project folder, run the same tests used by GitHub Actions:
+
+```powershell
+cargo test --locked
+```
+
+To run tests matching a name, pass a filter, for example:
+
+```powershell
+cargo test --locked search
+```
+
 ### Building in VS Code
 
 Install the **rust-analyzer** extension, open the integrated terminal
@@ -111,6 +125,7 @@ The Edit menu provides undo, redo, cut, copy and paste. The Program > About
 dialog shows the application version, description, designer and command-line usage.
 The toolbar beneath the file tabs opens Filter / Find and controls word wrap,
 hidden characters and tailing for the current tab.
+Word wrap and hidden-character markers also apply to the filter results.
 File > Find / Replace (F4 or Ctrl+F) also offers Replace all, which uses the
 current Find text and case-sensitivity setting. An empty replacement deletes
 matches; an empty Find text does nothing. Replacements can be undone and are

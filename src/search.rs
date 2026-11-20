@@ -196,22 +196,39 @@ impl SearchHighlights {
 
 #[derive(Default)]
 pub(crate) struct FilterState {
-    // (0-based line number, line text)
-    pub(crate) results: Vec<(usize, String)>,
+    // (0-based line number, line text, terminated by a newline)
+    pub(crate) results: Vec<(usize, String, bool)>,
     // Byte offset and line number of the first line not yet fully scanned.
     pub(crate) offset: usize,
     pub(crate) line: usize,
     pub(crate) applied: Option<(String, bool)>,
     pub(crate) selected: Option<usize>,
     pub(crate) needs_rescan: bool,
+    pub(crate) wrap_cache: Option<FilterWrapCache>,
+}
+
+pub(crate) struct FilterWrapCache {
+    pub(crate) width: f32,
+    pub(crate) font: FontId,
+    pub(crate) hidden: bool,
+    pub(crate) padding: egui::Vec2,
+    pub(crate) spacing: f32,
+    pub(crate) min_height: f32,
+    pub(crate) pixels_per_point: f32,
+    pub(crate) offsets: Vec<f32>,
 }
 
 impl FilterState {
     pub(crate) fn scan(&mut self, text: &str, pat: &str, case: bool) {
         let keep = self.line;
-        self.results.retain(|r| r.0 < keep);
+        let retained = self.results.partition_point(|r| r.0 < keep);
+        self.results.truncate(retained);
+        if let Some(cache) = &mut self.wrap_cache {
+            cache.offsets.truncate(retained + 1);
+        }
         if self.offset > text.len() || !text.is_char_boundary(self.offset) {
             self.results.clear();
+            self.wrap_cache = None;
             self.offset = 0;
             self.line = 0;
         }
@@ -226,7 +243,7 @@ impl FilterState {
             let hit = !needle.is_empty()
                 && if case { l.contains(&needle) } else { l.to_lowercase().contains(&needle) };
             if hit {
-                self.results.push((line, l.to_owned()));
+                self.results.push((line, l.to_owned(), terminated));
             }
             if !terminated {
                 break;

@@ -291,6 +291,201 @@ fn find_and_replace_inputs_are_left_aligned() {
 }
 
 #[test]
+fn filter_results_follow_wrap_and_hidden_character_settings() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    let long = format!("hit \t{}", "word ".repeat(80));
+    app.tabs[0].text = format!("{long}\nhit second\nhit last");
+    app.tabs[0].filter_text = "hit".into();
+    app.tabs[0].filter_open = true;
+    app.apply_search();
+
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let normal = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("     1  hit ") => Some(text),
+        _ => None,
+    }).unwrap();
+    assert_eq!(normal.galley.rows.len(), 1);
+    assert!(normal.galley.job.text.contains('\t'));
+    let word_x = normal.galley.rows[0].glyphs.iter().find(|glyph| glyph.chr == 'w').unwrap().pos.x;
+
+    app.tabs[0].hidden_chars = true;
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let marked = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("     1  hit·───→") => Some(text),
+        _ => None,
+    }).unwrap();
+    let marked_word_x = marked.galley.rows[0].glyphs.iter().find(|glyph| glyph.chr == 'w').unwrap().pos.x;
+    assert!((word_x - marked_word_x).abs() < 0.1);
+
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(input, |ui| {
+        egui::ScrollArea::both().id_salt(("filter_results", app.tabs[0].id))
+            .horizontal_scroll_offset(200.0).show(ui, |ui| ui.set_min_size(egui::vec2(2000.0, 600.0)));
+    });
+    output.textures_delta.clear();
+    app.tabs[0].word_wrap = true;
+    filter_frame(&ctx, &mut app, vec![]);
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let first = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("     1  hit·───→") => Some(text),
+        _ => None,
+    }).unwrap();
+    assert!(first.galley.rows.len() > 1);
+    assert!(first.pos.x >= 0.0);
+    assert!(first.galley.job.text.ends_with('¶'));
+    let second = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text == "     2  hit·second¶" => Some(text),
+        _ => None,
+    }).unwrap();
+    assert!(second.pos.y >= first.pos.y + first.galley.rect.height());
+    let offsets = &app.tabs[0].filter.wrap_cache.as_ref().unwrap().offsets;
+    assert!((second.pos.y - first.pos.y - (offsets[1] - offsets[0])).abs() < 1.0);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text == "     3  hit·last"
+    )));
+    assert_eq!(app.tabs[0].text, format!("{long}\nhit second\nhit last"));
+
+    let old_width = app.tabs[0].filter.wrap_cache.as_ref().unwrap().width;
+    let old_height = app.tabs[0].filter.wrap_cache.as_ref().unwrap().offsets[1];
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 600.0))),
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(input, |ui| app.filter_ui(ui));
+    output.textures_delta.clear();
+    let cache = app.tabs[0].filter.wrap_cache.as_ref().unwrap();
+    assert!(cache.width < old_width);
+    assert!(cache.offsets[1] > old_height);
+
+    app.tabs[0].word_wrap = false;
+    app.tabs[0].hidden_chars = false;
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text == format!("     1  {long}") && text.galley.rows.len() == 1
+    )));
+}
+
+#[test]
+fn wrapped_filter_row_heights_match_layout_at_different_scales() {
+    for font_size in [14.0, 30.0, 60.0] {
+        for scale in [1.0, 1.25] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut app = test_app();
+            app.font_size = font_size;
+            app.tabs[0].text = format!("hit {}\nhit second", "word ".repeat(36));
+            app.tabs[0].filter_text = "hit".into();
+            app.tabs[0].filter_open = true;
+            app.tabs[0].word_wrap = true;
+            app.apply_search();
+            let run = |app: &mut App| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 2000.0))),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| app.filter_ui(ui));
+                output.textures_delta.clear();
+                output
+            };
+            run(&mut app);
+            let output = run(&mut app);
+            let row = |prefix: &str| output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text.starts_with(prefix) => Some(text.pos.y),
+                _ => None,
+            }).unwrap_or_else(|| panic!("missing {prefix} at font size {font_size}, scale {scale}"));
+            let offsets = &app.tabs[0].filter.wrap_cache.as_ref().unwrap().offsets;
+            assert!((row("     2  hit second") - row("     1  hit ") - offsets[1]).abs() < 1.0,
+                "font size {font_size}, scale {scale}");
+        }
+    }
+}
+
+#[test]
+fn wrapped_filter_results_scroll_and_update_after_appends() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.tabs[0].text = (0..60).map(|i| format!("hit {i} {}", "word ".repeat((i % 5 + 1) * 35)))
+        .collect::<Vec<_>>().join("\n");
+    app.tabs[0].filter_text = "hit".into();
+    app.tabs[0].filter_open = true;
+    app.tabs[0].word_wrap = true;
+    app.apply_search();
+    filter_frame(&ctx, &mut app, vec![]);
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let visible = output.shapes.iter().filter(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains("hit ")
+    )).count();
+    assert!(visible < 30, "wrapped results should only render visible rows");
+    let offsets = &app.tabs[0].filter.wrap_cache.as_ref().unwrap().offsets;
+    let offset = offsets[25];
+    let height = *offsets.last().unwrap();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(input, |ui| {
+        egui::ScrollArea::vertical().id_salt(("filter_results", app.tabs[0].id))
+            .vertical_scroll_offset(offset).show(ui, |ui| ui.set_height(height));
+    });
+    output.textures_delta.clear();
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text.starts_with("    26  hit 25 ")
+    )));
+    app.tabs[0].text.push_str("\nhit appended");
+    let tab = &mut app.tabs[0];
+    tab.filter.scan(&tab.text, "hit", false);
+    assert_eq!(tab.filter.wrap_cache.as_ref().unwrap().offsets.len(), 60);
+    filter_frame(&ctx, &mut app, vec![]);
+    assert_eq!(app.tabs[0].filter.wrap_cache.as_ref().unwrap().offsets.len(), 62);
+    assert_eq!(app.tabs[0].filter.results.last().unwrap().1, "hit appended");
+}
+
+#[test]
+fn wrapped_filter_results_allow_double_clicking_continuation_rows() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.tabs[0].text = format!("hit {}\nhit second", "word ".repeat(80));
+    app.tabs[0].filter_text = "hit".into();
+    app.tabs[0].filter_open = true;
+    app.tabs[0].word_wrap = true;
+    app.apply_search();
+    let mut time = 0.0;
+    let mut run = |app: &mut App, events| {
+        time += 0.05;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.filter_ui(ui));
+        output.textures_delta.clear();
+        output
+    };
+    run(&mut app, vec![]);
+    let output = run(&mut app, vec![]);
+    let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("     1  hit ") => Some(text),
+        _ => None,
+    }).unwrap();
+    let pos = text.pos + text.galley.rows[1].rect().center().to_vec2();
+    let button = |pressed| egui::Event::PointerButton {
+        pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+    };
+    run(&mut app, vec![egui::Event::PointerMoved(pos), button(true)]);
+    run(&mut app, vec![button(false)]);
+    run(&mut app, vec![button(true)]);
+    run(&mut app, vec![button(false)]);
+    assert_eq!(app.tabs[0].filter.selected, Some(0));
+    assert_eq!(app.tabs[0].highlight, Some(0));
+}
+
+#[test]
 fn double_click_search_result_preserves_horizontal_scroll() {
     for font_size in [14.0, 30.0] {
         for horizontal in [0.0, 120.0] {
@@ -373,7 +568,7 @@ fn double_click_search_result_preserves_horizontal_scroll() {
                 _ => None,
             }).unwrap();
             assert!(text.galley.job.sections.iter().any(|s| {
-                s.format.color == Color32::YELLOW
+                s.format.color == Color32::from_rgb(0, 255, 255)
                     && text.galley.job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)].starts_with("needle ")
             }));
             assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == Color32::from_rgba_unmultiplied(255, 214, 0, 55))));
@@ -524,7 +719,7 @@ fn search_highlighting_handles_unicode_wrap_and_tail_updates() {
 }
 
 #[test]
-fn selected_search_line_uses_yellow_text_without_overriding_other_matches() {
+fn selected_search_line_uses_color_text_without_overriding_other_matches() {
     let mut highlights = SearchHighlights::default();
     let text = "hit first\nhit second\nother";
     highlights.search(text, "hit", false);
@@ -536,13 +731,13 @@ fn selected_search_line_uses_yellow_text_without_overriding_other_matches() {
                 &job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)],
             )).collect();
             assert!(sections.iter().any(|(color, text)| *color == Color32::WHITE && *text == "hit"));
-            assert!(sections.iter().any(|(color, text)| *color == Color32::YELLOW && text.starts_with("hit")));
+            assert!(sections.iter().any(|(color, text)| *color == Color32::from_rgb(0, 255, 255) && text.starts_with("hit")));
             assert!(!sections.iter().any(|(color, text)| *color == Color32::WHITE && text.contains("second")));
         }
     }
     highlights.active = false;
     let job = search_layout(text, &highlights, Some(1), false, &FontId::monospace(14.0), f32::INFINITY, false);
-    assert!(job.sections.iter().any(|s| s.format.color == Color32::YELLOW));
+    assert!(job.sections.iter().any(|s| s.format.color == Color32::from_rgb(0, 255, 255)));
 }
 
 #[test]
