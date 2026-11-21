@@ -152,10 +152,8 @@ impl App {
         });
         if go && !tab.goto_text.is_empty() && tab.goto_text.bytes().all(|b| b.is_ascii_digit()) {
             if let Ok(line) = tab.goto_text.parse::<usize>() {
-                let total = tab.text.bytes().filter(|&b| b == b'\n').count() + 1;
-                if (1..=total).contains(&line) {
+                if let Some(offset) = line.checked_sub(1).and_then(|line| tab.text.line_start_char(line)) {
                     tab.goto_line = Some(line - 1);
-                    let offset: usize = tab.text.split_inclusive('\n').take(line - 1).map(|l| l.chars().count()).sum();
                     #[allow(deprecated)]
                     let id = egui::Id::new(("editor", tab.id));
                     let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();

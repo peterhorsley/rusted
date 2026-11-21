@@ -8,7 +8,9 @@ The editor still lays out the entire document with egui's `TextEdit`. Only
 gutter, highlight background and hidden-character marker painting are limited
 to visible rows. Opening, wrapping and highlighting large files can therefore
 block the UI, and responsive editing and scrolling of 100 MB files is not yet
-supported. A virtualized editor needs to retain correct full-document editing,
+supported. A sparse document line index is cached for line counts and go-to-line;
+it is rebuilt after text changes and does not virtualize text layout.
+A virtualized editor needs to retain correct full-document editing,
 selection, navigation and wrapped-line scroll geometry; returning a partial
 galley to `TextEdit` is not sufficient.
 

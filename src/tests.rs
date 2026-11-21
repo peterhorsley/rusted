@@ -1,4 +1,5 @@
 use crate::app::*;
+use crate::document::DocumentText;
 use crate::editor::*;
 use crate::search::*;
 use crate::settings::*;
@@ -77,6 +78,26 @@ fn startup_tail_opens_file_and_tracks_appends() {
     std::fs::write(&path, "first\nsecond\n").unwrap();
     app.update_filter(true);
     assert_eq!(app.tabs[0].text, "first\nsecond\n");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn tail_accepts_file_with_active_writer() {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!(
+        "rusted-active-writer-{}-{}.txt", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::write(&path, "first\n").unwrap();
+    let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut app = test_app();
+    app.tabs.clear();
+    app.open_startup_file(path.clone(), true);
+    assert!(app.tabs[0].tail);
+    writer.write_all(b"second\n").unwrap();
+    app.update_filter(true);
+    assert_eq!(app.tabs[0].text, "first\nsecond\n");
+    drop(writer);
     std::fs::remove_file(path).unwrap();
 }
 
@@ -326,7 +347,7 @@ fn document_wide_selection_copy_paste_and_undo_with_view_options() {
         let original = (0..100)
             .map(|line| format!("{line:03} hit café \t{}\n", "long text ".repeat(10)))
             .collect::<String>();
-        app.tabs[0].text = original.clone();
+        app.tabs[0].text = original.clone().into();
         app.tabs[0].saved_text = original.clone();
         app.tabs[0].word_wrap = wrap;
         app.tabs[0].hidden_chars = true;
@@ -349,6 +370,42 @@ fn document_wide_selection_copy_paste_and_undo_with_view_options() {
         assert_eq!(app.tabs[0].text, original, "undo must restore the whole document, wrap={wrap}");
         assert!(!app.tabs[0].dirty);
     }
+}
+
+#[test]
+fn document_line_index_tracks_unicode_and_edits() {
+    let text = (0..770).map(|i| format!("{i} é😀\n")).collect::<String>();
+    let mut document = DocumentText::from(text);
+    let verify = |document: &mut DocumentText| {
+        let expected = document.split('\n').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(document.line_count(), expected.len());
+        let mut chars = 0;
+        for (line, content) in expected.iter().enumerate() {
+            assert_eq!(document.line_start_char(line), Some(chars), "line {line}");
+            chars += content.chars().count() + 1;
+        }
+        assert_eq!(document.line_start_char(expected.len()), None);
+    };
+    verify(&mut document);
+    let at = egui::text::CharIndex(0);
+    egui::TextBuffer::insert_text(&mut document, "Ω\n", at);
+    verify(&mut document);
+    egui::TextBuffer::delete_char_range(
+        &mut document, egui::text::CharIndex(0)..egui::text::CharIndex(2),
+    );
+    verify(&mut document);
+    document.push_str("tail\n");
+    verify(&mut document);
+    *document = "😀\nlast".to_owned();
+    verify(&mut document);
+    *document = "a\nb".to_owned();
+    assert_eq!(document.line_start_char(1), Some(2));
+    *document = "ab\n".to_owned();
+    assert_eq!(document.line_start_char(1), Some(3));
+    egui::TextBuffer::replace_with(&mut document, "x\n");
+    assert_eq!(document.line_start_char(1), Some(2));
+    assert_eq!(egui::TextBuffer::take(&mut document), "x\n");
+    verify(&mut document);
 }
 
 fn has_linear_selection(output: &egui::FullOutput, color: Color32) -> bool {
@@ -403,7 +460,7 @@ fn filter_results_follow_wrap_and_hidden_character_settings() {
     let ctx = egui::Context::default();
     let mut app = test_app();
     let long = format!("hit \t{}", "word ".repeat(80));
-    app.tabs[0].text = format!("{long}\nhit second\nhit last");
+    app.tabs[0].text = format!("{long}\nhit second\nhit last").into();
     app.tabs[0].filter_text = "hit".into();
     app.tabs[0].filter_open = true;
     app.apply_search();
@@ -485,7 +542,7 @@ fn wrapped_filter_row_heights_match_layout_at_different_scales() {
             ctx.set_pixels_per_point(scale);
             let mut app = test_app();
             app.font_size = font_size;
-            app.tabs[0].text = format!("hit {}\nhit second", "word ".repeat(36));
+            app.tabs[0].text = format!("hit {}\nhit second", "word ".repeat(36)).into();
             app.tabs[0].filter_text = "hit".into();
             app.tabs[0].filter_open = true;
             app.tabs[0].word_wrap = true;
@@ -517,7 +574,7 @@ fn wrapped_filter_results_scroll_and_update_after_appends() {
     let ctx = egui::Context::default();
     let mut app = test_app();
     app.tabs[0].text = (0..60).map(|i| format!("hit {i} {}", "word ".repeat((i % 5 + 1) * 35)))
-        .collect::<Vec<_>>().join("\n");
+        .collect::<Vec<_>>().join("\n").into();
     app.tabs[0].filter_text = "hit".into();
     app.tabs[0].filter_open = true;
     app.tabs[0].word_wrap = true;
@@ -557,7 +614,7 @@ fn wrapped_filter_results_scroll_and_update_after_appends() {
 fn wrapped_filter_results_allow_double_clicking_continuation_rows() {
     let ctx = egui::Context::default();
     let mut app = test_app();
-    app.tabs[0].text = format!("hit {}\nhit second", "word ".repeat(80));
+    app.tabs[0].text = format!("hit {}\nhit second", "word ".repeat(80)).into();
     app.tabs[0].filter_text = "hit".into();
     app.tabs[0].filter_open = true;
     app.tabs[0].word_wrap = true;
@@ -604,7 +661,7 @@ fn double_click_search_result_preserves_horizontal_scroll() {
             let long_line = "abcdefghij".repeat(80);
             app.tabs[0].text = (0..100).map(|i| {
                 if i == 70 { format!("needle {long_line}") } else { format!("line {i} {long_line}") }
-            }).collect::<Vec<_>>().join("\n");
+            }).collect::<Vec<_>>().join("\n").into();
             app.tabs[0].filter_open = true;
             app.tabs[0].filter_text = "needle".into();
             app.apply_search();
@@ -835,7 +892,7 @@ fn viewport_decorations_and_status_follow_deep_wrapped_navigation() {
         ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
         let mut app = test_app();
         let line = format!("é{}\n", "a".repeat(120));
-        app.tabs[0].text = line.repeat(1000);
+        app.tabs[0].text = line.repeat(1000).into();
         app.tabs[0].word_wrap = wrap;
         app.tabs[0].hidden_chars = true;
         goto_frame(&ctx, &mut app, vec![]);
@@ -866,7 +923,7 @@ fn viewport_gutter_tracks_mouse_wheel_scroll() {
     let ctx = egui::Context::default();
     ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
     let mut app = test_app();
-    app.tabs[0].text = (0..1000).map(|i| format!("row {i:04}\n")).collect();
+    app.tabs[0].text = (0..1000).map(|i| format!("row {i:04}\n")).collect::<String>().into();
     goto_frame(&ctx, &mut app, vec![]);
     let text_y = |output: &egui::FullOutput| {
         output.shapes.iter().find_map(|shape| match &shape.shape {
@@ -1351,7 +1408,7 @@ fn goto_line_menu_scrolls_and_paints_white_with_wrap_and_tail() {
         ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
         let mut app = test_app();
         app.tabs[0].text = (1..=100).map(|i| format!("line {i} {}", "abcdefghij".repeat(12)))
-            .collect::<Vec<_>>().join("\n");
+            .collect::<Vec<_>>().join("\n").into();
         app.tabs[0].word_wrap = wrap;
         app.tabs[0].tail = true;
         app.tabs[0].filter_open = true;
@@ -1387,7 +1444,7 @@ fn goto_line_preserves_horizontal_scroll_and_search_highlight() {
     ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
     let mut app = test_app();
     app.tabs[0].text = (0..100).map(|i| format!("line {i} {}", "abcdefghij".repeat(80)))
-        .collect::<Vec<_>>().join("\n");
+        .collect::<Vec<_>>().join("\n").into();
     app.tabs[0].filter_text = "line".into();
     app.apply_search();
     app.tabs[0].highlight = Some(2);
@@ -1948,7 +2005,7 @@ fn key_event(key: Key, modifiers: Modifiers) -> egui::Event {
 fn keyboard_undo_ignores_cursor_only_history_and_preserves_position() {
     let ctx = egui::Context::default();
     let mut app = test_app();
-    app.tabs[0].text = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+    app.tabs[0].text = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into();
     frame(&ctx, &mut app, vec![], false);
     #[allow(deprecated)]
     let id = egui::Id::new(("editor", app.tabs[0].id));
@@ -2275,7 +2332,7 @@ fn column_selection_copies_visible_characters_at_scaled_width() {
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(1.25);
     let mut app = test_app();
-    app.tabs[0].text = format!("{}\n{}", "0123456789".repeat(12), "abcdefghij".repeat(12));
+    app.tabs[0].text = format!("{}\n{}", "0123456789".repeat(12), "abcdefghij".repeat(12)).into();
     let output = frame(&ctx, &mut app, vec![], false);
     let text = output.shapes.iter().find_map(|shape| match &shape.shape {
         egui::Shape::Text(text) if text.galley.rows.len() == 2 => Some(text),
@@ -2344,7 +2401,7 @@ fn column_selection_uses_visible_rows() {
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(1.25);
     let mut app = test_app();
-    app.tabs[0].text = (0..100).map(|i| format!("{i:03}-abcdefgh")).collect::<Vec<_>>().join("\n");
+    app.tabs[0].text = (0..100).map(|i| format!("{i:03}-abcdefgh")).collect::<Vec<_>>().join("\n").into();
     let output = frame(&ctx, &mut app, vec![], false);
     let text = output.shapes.iter().find_map(|shape| match &shape.shape {
         egui::Shape::Text(text) if text.galley.rows.len() == 100 => Some(text),

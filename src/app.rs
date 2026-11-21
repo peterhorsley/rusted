@@ -1,4 +1,5 @@
 use crate::editor::*;
+use crate::document::DocumentText;
 use crate::search::*;
 use crate::settings::*;
 use crate::toolbar::*;
@@ -25,7 +26,7 @@ pub(crate) fn remember_history(history: &mut Vec<String>, value: &str) {
 pub(crate) struct Tab {
     pub(crate) id: u64,
     pub(crate) path: Option<PathBuf>,
-    pub(crate) text: String,
+    pub(crate) text: DocumentText,
     pub(crate) saved_text: String,
     pub(crate) crlf: bool,
     // Bytes of the file on disk that are reflected in `text`.
@@ -241,7 +242,7 @@ pub(crate) fn reload_from_disk(tab: &mut Tab, path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else { return false };
     let s = String::from_utf8_lossy(&bytes).into_owned();
     tab.crlf = s.contains("\r\n");
-    tab.text = if tab.crlf { s.replace("\r\n", "\n") } else { s };
+    tab.text = (if tab.crlf { s.replace("\r\n", "\n") } else { s }).into();
     tab.saved_text = tab.text.clone();
     tab.search_highlights.search(&tab.text, &tab.applied.0, tab.applied.1);
     tab.disk_len = bytes.len() as u64;
@@ -607,7 +608,7 @@ impl App {
             id: self.next_id,
             path,
             saved_text: text.clone(),
-            text,
+            text: text.into(),
             crlf,
             disk_len,
             dirty: false,
@@ -804,7 +805,7 @@ impl App {
         state.set_undoer(undoer);
         state.cursor.set_char_range(Some(new_range));
         state.store(ctx, id);
-        tab.text = text;
+        tab.text = text.into();
         tab.search_highlights.edited(&tab.text);
         tab.dirty = tab.text != tab.saved_text;
         tab.highlight = None;

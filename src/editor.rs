@@ -234,7 +234,7 @@ impl App {
                 });
             }
         }
-        let total = tab.text.bytes().filter(|&b| b == b'\n').count() + 1;
+        let total = tab.text.line_count();
         let gutter_digits = total.to_string().len().max(3);
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let gutter_w = char_w * (gutter_digits as f32 + 2.0);
