@@ -152,13 +152,16 @@ impl App {
         });
         if go && !tab.goto_text.is_empty() && tab.goto_text.bytes().all(|b| b.is_ascii_digit()) {
             if let Ok(line) = tab.goto_text.parse::<usize>() {
-                if let Some(offset) = line.checked_sub(1).and_then(|line| tab.text.line_start_char(line)) {
+                if let Some(target) = line.checked_sub(1).filter(|&line| line < tab.text.line_count()) {
                     tab.goto_line = Some(line - 1);
-                    #[allow(deprecated)]
-                    let id = egui::Id::new(("editor", tab.id));
-                    let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
-                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(offset))));
-                    state.store(ui.ctx(), id);
+                    if !self.virtual_preview {
+                        let offset = tab.text.line_start_char(target).expect("validated line");
+                        #[allow(deprecated)]
+                        let id = egui::Id::new(("editor", tab.id));
+                        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(offset))));
+                        state.store(ui.ctx(), id);
+                    }
                     tab.col_sel = None;
                     tab.scroll_to_goto = Some(line - 1);
                     tab.scroll_to_highlight = false;
@@ -248,7 +251,7 @@ impl App {
             if let Some(entry) = history_menu(ui, replace_history, "Replace history") {
                 tab.replace_text = entry;
             }
-            replace = ui.add_enabled(!tab.tail, egui::Button::new("Replace all")).clicked();
+            replace = ui.add_enabled(!tab.tail && !self.virtual_preview, egui::Button::new("Replace all")).clicked();
         });
         if search {
             self.apply_search();
@@ -393,10 +396,14 @@ impl App {
                     ui.close();
                 }
             });
-            let editable = self.browser.is_none() && !self.tabs[self.active].tail;
+            let editable = self.browser.is_none() && !self.tabs[self.active].tail && !self.virtual_preview;
             let mut action = None;
             let menu = ui.menu_button("Edit", |ui| {
-                let (can_undo, can_redo, selected) = self.edit_availability(ui);
+                let (can_undo, can_redo, selected) = if self.virtual_preview {
+                    (false, false, false)
+                } else {
+                    self.edit_availability(ui)
+                };
                 if !self.edit_menu_open {
                     #[cfg(test)]
                     let status = self.clipboard_test_status.clone().unwrap_or_else(clipboard_has_text);
@@ -435,6 +442,13 @@ impl App {
                 ui.ctx().request_repaint();
             }
             ui.menu_button("Program", |ui| {
+                if ui.button(if self.virtual_preview { "Disable virtual preview" } else { "Enable virtual preview" }).clicked() {
+                    self.virtual_preview = !self.virtual_preview;
+                    self.pending_edit = None;
+                    self.editor_selection = None;
+                    self.focus_editor = true;
+                    ui.close();
+                }
                 if ui.button(if self.light_theme { "Dark theme" } else { "Light theme" }).clicked() {
                     self.light_theme = !self.light_theme;
                     ui.ctx().set_visuals(theme_visuals(self.light_theme));
@@ -520,7 +534,7 @@ impl App {
                 toggle_tail = true;
             }
             if is_json && ui.add_enabled(
-                self.browser.is_none() && !tab.tail,
+                self.browser.is_none() && !tab.tail && !self.virtual_preview,
                 toolbar_button(&icons.format_json, "Format JSON", false),
             ).on_hover_text("Format JSON with two-space indentation").clicked() {
                 format_json = true;

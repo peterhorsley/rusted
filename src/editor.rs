@@ -181,6 +181,10 @@ pub(crate) fn user_interacted(ui: &egui::Ui, rect: egui::Rect) -> bool {
 
 impl App {
     pub(crate) fn editor_ui(&mut self, ui: &mut egui::Ui) {
+        if self.virtual_preview {
+            self.virtual_preview_ui(ui);
+            return;
+        }
         let font = FontId::monospace(self.font_size);
         let tab = &mut self.tabs[self.active];
         let wrap = tab.word_wrap;

@@ -28,6 +28,7 @@ fn test_app() -> App {
         pending_edit: None,
         edit_menu_open: false,
         clipboard_status: Ok(false),
+        virtual_preview: false,
         #[cfg(windows)]
         launches: None,
         clipboard_test_status: Some(Ok(true)),
@@ -406,6 +407,199 @@ fn document_line_index_tracks_unicode_and_edits() {
     assert_eq!(document.line_start_char(1), Some(2));
     assert_eq!(egui::TextBuffer::take(&mut document), "x\n");
     verify(&mut document);
+}
+
+#[test]
+fn virtual_preview_line_index_handles_long_unicode_lines_and_mutation() {
+    let long = format!("{}😀end", "x".repeat(2047));
+    let text = format!("{}\n{long}\nafter\n", "short\n".repeat(260));
+    let mut document = DocumentText::from(text);
+    let rows = document.preview_lines_from(259).unwrap().collect::<Vec<_>>();
+    assert_eq!(rows, vec![("short", false), ("", false), (&long[..2047], true), ("after", false), ("", false)]);
+    assert!(document.preview_lines_from(264).is_none());
+    document.push_str("tail");
+    assert_eq!(document.preview_lines_from(263).unwrap().collect::<Vec<_>>(), vec![("tail", false)]);
+    *document = "changed\n".to_owned();
+    assert_eq!(document.preview_lines_from(0).unwrap().collect::<Vec<_>>(), vec![("changed", false), ("", false)]);
+}
+
+fn virtual_rows(output: &egui::FullOutput) -> Vec<String> {
+    output.shapes.iter().filter_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("row ") => Some(text.galley.job.text.clone()),
+        _ => None,
+    }).collect()
+}
+
+#[test]
+fn virtual_preview_layouts_only_viewport_and_navigates() {
+    let ctx = egui::Context::default();
+    ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].text = (0..10000).map(|i| format!("row {i:05}\n")).collect::<String>().into();
+    frame(&ctx, &mut app, vec![], false);
+    let rows = virtual_rows(&frame(&ctx, &mut app, vec![], false));
+    assert!(rows.contains(&"row 00000".to_owned()), "{rows:?}");
+    assert!(rows.len() < 100, "viewport laid out {} rows", rows.len());
+    frame(&ctx, &mut app, vec![
+        egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -180.0),
+            phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+    ], false);
+    let wheel = virtual_rows(&frame(&ctx, &mut app, vec![], false));
+    assert_ne!(rows[0], wheel[0], "wheel must advance the viewport");
+    app.tabs[0].scroll_to_goto = Some(9000);
+    frame(&ctx, &mut app, vec![], false);
+    let deep = virtual_rows(&frame(&ctx, &mut app, vec![], false));
+    assert!(deep.contains(&"row 09000".to_owned()), "{deep:?}");
+    assert!(deep.len() < 100);
+    frame(&ctx, &mut app, vec![key_event(Key::PageDown, Modifiers::NONE)], false);
+    let paged = virtual_rows(&frame(&ctx, &mut app, vec![], false));
+    assert!(paged[0] > deep[0], "keyboard PageDown: {deep:?} -> {paged:?}");
+    frame(&ctx, &mut app, vec![key_event(Key::End, Modifiers::COMMAND)], false);
+    let end = virtual_rows(&frame(&ctx, &mut app, vec![], false));
+    assert!(end.contains(&"row 09999".to_owned()), "{end:?}");
+    frame(&ctx, &mut app, vec![key_event(Key::Home, Modifiers::COMMAND)], false);
+    let home = virtual_rows(&frame(&ctx, &mut app, vec![], false));
+    assert_eq!(home[0], "row 00000");
+    let original = app.tabs[0].text.to_string();
+    frame(&ctx, &mut app, vec![egui::Event::Text("edited".into()), egui::Event::Paste("paste".into())], false);
+    assert_eq!(app.tabs[0].text, original);
+}
+
+#[test]
+fn virtual_preview_truncates_long_lines_without_losing_following_rows() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].text = format!("{}😀end\nrow after", "x".repeat(2047) + &"y".repeat(100_000)).into();
+    let output = frame(&ctx, &mut app, vec![], false);
+    let shown = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("xxxx") => Some(&text.galley.job.text),
+        _ => None,
+    }).unwrap();
+    assert!(shown.ends_with('…'));
+    assert_eq!(shown.len(), 2048 + '…'.len_utf8());
+    assert!(virtual_rows(&output).contains(&"row after".to_owned()));
+}
+
+#[test]
+fn virtual_preview_menu_switch_preserves_text_and_disables_replace() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    let original = app.tabs[0].text.to_string();
+    let output = goto_frame(&ctx, &mut app, vec![]);
+    let output = goto_click(&ctx, &mut app, find_label(&output, "Program"));
+    goto_click(&ctx, &mut app, find_label(&output, "Enable virtual preview"));
+    assert!(app.virtual_preview);
+    app.tabs[0].filter_open = true;
+    app.tabs[0].filter_text = "abc".into();
+    app.tabs[0].replace_text = "replacement".into();
+    app.apply_search();
+    let output = goto_frame(&ctx, &mut app, vec![]);
+    goto_click(&ctx, &mut app, find_label(&output, "Replace all"));
+    assert_eq!(app.tabs[0].text, original);
+    let output = goto_frame(&ctx, &mut app, vec![]);
+    let output = goto_click(&ctx, &mut app, find_label(&output, "Program"));
+    goto_click(&ctx, &mut app, find_label(&output, "Disable virtual preview"));
+    assert!(!app.virtual_preview);
+    assert_eq!(app.tabs[0].text, original);
+}
+
+#[test]
+fn virtual_preview_scrollbar_drag_changes_visible_content() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].text = (0..10000).map(|i| format!("row {i:05}\n")).collect::<String>().into();
+    frame(&ctx, &mut app, vec![], false);
+    frame(&ctx, &mut app, vec![], false);
+    let start = egui::pos2(795.0, 55.0);
+    let end = egui::pos2(795.0, 450.0);
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+    };
+    frame(&ctx, &mut app, vec![egui::Event::PointerMoved(start), button(start, true)], false);
+    frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], false);
+    frame(&ctx, &mut app, vec![button(end, false)], false);
+    let rows = virtual_rows(&frame(&ctx, &mut app, vec![], false));
+    assert!(rows[0].as_str() > "row 01000", "scrollbar drag did not navigate: {rows:?}");
+}
+
+#[test]
+fn virtual_preview_goto_and_tail_show_updated_document() {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!(
+        "rusted-preview-tail-{}-{}.txt", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let original = (0..1000).map(|i| format!("row {i:05}\n")).collect::<String>();
+    std::fs::write(&path, &original).unwrap();
+    let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs.clear();
+    app.open_startup_file(path.clone(), true);
+    goto_frame(&ctx, &mut app, vec![]);
+    app.open_goto();
+    app.tabs[0].goto_text = "501".into();
+    let output = goto_frame(&ctx, &mut app, vec![]);
+    goto_click(&ctx, &mut app, find_label(&output, "Go"));
+    let rows = virtual_rows(&goto_frame(&ctx, &mut app, vec![]));
+    assert!(rows.contains(&"row 00500".to_owned()), "{rows:?}");
+    writer.write_all(b"row 01000\n").unwrap();
+    app.update_filter(true);
+    goto_frame(&ctx, &mut app, vec![]);
+    let rows = virtual_rows(&goto_frame(&ctx, &mut app, vec![]));
+    assert!(rows.contains(&"row 01000".to_owned()), "{rows:?}");
+    drop(writer);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "manual release-mode profile using test-large-file.txt"]
+fn profile_virtual_preview() {
+    let path = std::env::var_os("RUSTED_PROFILE_FILE")
+        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("test-large-file.txt"));
+    let start = Instant::now();
+    let mut app = test_app();
+    app.open_path(path.clone());
+    assert!(app.message.is_none(), "{:?}", app.message);
+    app.virtual_preview = true;
+    eprintln!("open {}: {:?}", path.display(), start.elapsed());
+    let ctx = egui::Context::default();
+    for name in ["initial", "redraw", "search", "deep"] {
+        let start = Instant::now();
+        if name == "search" {
+            app.tabs[app.active].filter_open = true;
+            app.tabs[app.active].filter_text = "response".into();
+            app.apply_search();
+            eprintln!("search setup: {:?}", start.elapsed());
+            eprintln!("search matches: {}", app.tabs[app.active].filter.results.len());
+        } else if name == "deep" {
+            app.tabs[app.active].scroll_to_goto = Some(app.tabs[app.active].text.line_count() * 9 / 10);
+        }
+        let start = Instant::now();
+        let output = goto_frame(&ctx, &mut app, vec![]);
+        eprintln!("{name} frame: {:?}, {} shapes", start.elapsed(), output.shapes.len());
+    }
+    let start = Instant::now();
+    goto_frame(&ctx, &mut app, vec![
+        egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -180.0),
+            phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    eprintln!("search wheel input frame: {:?}", start.elapsed());
+    let start = Instant::now();
+    goto_frame(&ctx, &mut app, vec![]);
+    eprintln!("search scrolled frame: {:?}", start.elapsed());
 }
 
 fn has_linear_selection(output: &egui::FullOutput, color: Color32) -> bool {

@@ -228,6 +228,7 @@ pub(crate) struct App {
     pub(crate) pending_edit: Option<PendingEdit>,
     pub(crate) edit_menu_open: bool,
     pub(crate) clipboard_status: Result<bool, String>,
+    pub(crate) virtual_preview: bool,
     #[cfg(windows)]
     pub(crate) launches: Option<std::sync::mpsc::Receiver<Result<crate::single_instance::Launch, String>>>,
     #[cfg(test)]
@@ -394,7 +395,11 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(root, |ui| {
             ui.horizontal(|ui| {
                 let (total, l, c) = self.status;
-                ui.label(format!("Lines: {total}    Ln: {l}    Col: {c}"));
+                if self.virtual_preview {
+                    ui.label(format!("Lines: {total}    First visible: {l}"));
+                } else {
+                    ui.label(format!("Lines: {total}    Ln: {l}    Col: {c}"));
+                }
                 if let Some(m) = &self.message {
                     ui.colored_label(Color32::LIGHT_RED, m);
                 }
@@ -574,6 +579,7 @@ impl App {
             pending_edit: None,
             edit_menu_open: false,
             clipboard_status: Ok(false),
+            virtual_preview: false,
             #[cfg(windows)]
             launches: None,
             #[cfg(test)]

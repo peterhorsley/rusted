@@ -6,6 +6,7 @@ mod editor;
 mod search;
 mod settings;
 mod toolbar;
+mod virtual_preview;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(test)]
