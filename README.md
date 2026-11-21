@@ -17,11 +17,12 @@ the original file; the preview does not show search highlights, selection,
 or hidden characters. It shows only the first 2048 bytes of a
 long line, with an ellipsis, and is not an editor. The existing editor remains
 available via Program > Disable virtual preview. In the preview, Find results
-remain unwrapped even when the preview is wrapped; the normal editor retains
-its existing Find-result wrapping behavior.
+also wrap when Word wrap is enabled. Wrapped Find-result heights are estimated
+until viewed, so scrollbar positions can shift. Wrapped results show at most
+the first 2048 bytes of each matching line, with an ellipsis.
 
 The sparse document line index is rebuilt after text changes, including tail
-appends. Wrapped Find results can still require whole-result layout. Responsive
+appends. Wrapped Find results in the normal editor can still require whole-result layout. Responsive
 editing, wrapping and tailing of 100 MB files are not yet established.
 
 To profile the optional local sample, run
@@ -30,6 +31,8 @@ Use `cargo test --release --locked profile_virtual_preview -- --ignored --nocapt
 to measure the experimental preview, including its Find results panel.
 Use `cargo test --release --locked profile_wrapped_virtual_preview -- --ignored --nocapture`
 to measure the wrapped preview.
+Use `cargo test --release --locked profile_preview_wrapped_find -- --ignored --nocapture`
+to measure the wrapped Find results.
 The normal-editor benchmark checks that wheel input changes the visible gutter lines and
 reports both the input frame and the subsequent scrolled frame. It measures
 headless egui frames, not GPU rendering or end-to-end UI latency.

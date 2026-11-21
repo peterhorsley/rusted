@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32, FontId, Key, Modifiers};
 impl App {
     pub(crate) fn virtual_preview_ui(&mut self, ui: &mut egui::Ui) {
         ui.label("Virtual preview: read-only, no selection, search highlighting or hidden markers.");
-        ui.label("Lines longer than 2048 bytes are truncated in this preview.");
+        ui.label("Long lines and wrapped Find results truncate at 2048 bytes.");
         if self.tabs[self.active].word_wrap {
             self.wrapped_preview_ui(ui);
             return;

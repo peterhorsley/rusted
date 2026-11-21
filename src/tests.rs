@@ -1070,6 +1070,313 @@ fn wrapped_filter_results_allow_double_clicking_continuation_rows() {
 }
 
 #[test]
+fn preview_wrapped_find_lays_out_only_visible_results() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].word_wrap = true;
+    app.tabs[0].hidden_chars = true;
+    app.tabs[0].filter_open = true;
+    app.tabs[0].text = (0..10000).map(|i| format!("hit {i:05} é\t{}\n", "some words ".repeat(20))).collect::<String>().into();
+    app.tabs[0].filter_text = "hit".into();
+    app.apply_search();
+    filter_frame(&ctx, &mut app, vec![]);
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let rows = output.shapes.iter().filter_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.contains("hit·") => Some(text),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert!(rows.len() > 1 && rows.len() < 30, "visible results: {}", rows.len());
+    assert!(rows[0].galley.rows.len() > 1);
+    assert!(rows[0].galley.job.text.contains("───→"));
+    for pair in rows.windows(2) {
+        assert!(pair[1].pos.y >= pair[0].pos.y + pair[0].galley.size().y - 0.1);
+    }
+    let measured = app.tabs[0].filter.preview_wrap_cache.as_ref().unwrap().measured_count();
+    assert!(measured < 30, "measured {measured} of 10000 results");
+    let first = rows[0].galley.job.text.clone();
+    filter_frame(&ctx, &mut app, vec![
+        egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::ZERO,
+            phase: egui::TouchPhase::Start, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -180.0),
+            phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let after = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.contains("hit·") => Some(&text.galley.job.text),
+        _ => None,
+    }).unwrap();
+    assert!(after > &first, "wheel did not advance results: {first:?} -> {after:?}");
+}
+
+#[test]
+fn preview_wrapped_find_handles_empty_and_replaced_results() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].word_wrap = true;
+    app.tabs[0].filter_open = true;
+    app.tabs[0].text = format!("first {}\nsecond {}", "x ".repeat(120), "y ".repeat(120)).into();
+    app.tabs[0].filter_text = "absent".into();
+    app.apply_search();
+    filter_frame(&ctx, &mut app, vec![]);
+    app.tabs[0].filter_text = "first".into();
+    app.apply_search();
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text.starts_with("     1  first ")
+    )));
+    app.tabs[0].filter_text = "second".into();
+    app.apply_search();
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text.starts_with("     2  second ")
+    )));
+    assert!(!output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text.starts_with("     1  first ")
+    )));
+}
+
+#[test]
+fn preview_wrapped_find_double_clicks_continuation_and_truncates_long_results() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].word_wrap = true;
+    app.tabs[0].filter_open = true;
+    app.tabs[0].text = format!("hit {}\nhit second", "word ".repeat(10000)).into();
+    app.tabs[0].filter_text = "hit".into();
+    app.apply_search();
+    let mut time = 0.0;
+    let mut run = |app: &mut App, events| {
+        time += 0.05;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            time: Some(time), events, ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.filter_ui(ui));
+        output.textures_delta.clear();
+        output
+    };
+    run(&mut app, vec![]);
+    let output = run(&mut app, vec![]);
+    let row = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("     1  hit ") => Some(text),
+        _ => None,
+    }).unwrap();
+    assert!(row.galley.job.text.ends_with('…'));
+    assert!(row.galley.job.text.len() <= 8 + 2048 + '…'.len_utf8());
+    let pos = row.pos + row.galley.rows[1].rect().center().to_vec2();
+    let button = |pressed| egui::Event::PointerButton {
+        pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+    };
+    run(&mut app, vec![egui::Event::PointerMoved(pos), button(true)]);
+    run(&mut app, vec![button(false)]);
+    run(&mut app, vec![button(true)]);
+    run(&mut app, vec![button(false)]);
+    assert_eq!(app.tabs[0].filter.selected, Some(0));
+    assert_eq!(app.tabs[0].highlight, Some(0));
+}
+
+#[test]
+fn preview_wrapped_find_double_click_navigates_the_editor() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].word_wrap = true;
+    app.tabs[0].filter_open = true;
+    app.tabs[0].text = (0..1000).map(|i| {
+        if i == 900 { format!("hit target {}", "words ".repeat(20)) } else { format!("other {i}") }
+    }).collect::<Vec<_>>().join("\n").into();
+    app.tabs[0].filter_text = "hit target".into();
+    app.apply_search();
+    goto_frame(&ctx, &mut app, vec![]);
+    let output = goto_frame(&ctx, &mut app, vec![]);
+    let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("   901  hit target") => {
+            Some(text.pos + text.galley.rows[0].rect().center().to_vec2())
+        }
+        _ => None,
+    }).unwrap();
+    goto_click(&ctx, &mut app, pos);
+    goto_click(&ctx, &mut app, pos);
+    let output = goto_frame(&ctx, &mut app, vec![]);
+    assert_eq!(app.tabs[0].highlight, Some(900));
+    assert_eq!(app.status.1, 901);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text.starts_with("hit target ")
+    )));
+}
+
+#[test]
+fn preview_wrapped_find_follows_tail_and_rescans_changed_last_result() {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!(
+        "rusted-preview-find-tail-{}-{}.txt", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let text = (0..100).map(|i| format!("hit {i:05} {}\n", "word ".repeat(40))).collect::<String>();
+    std::fs::write(&path, text).unwrap();
+    let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs.clear();
+    app.open_startup_file(path.clone(), true);
+    app.tabs[0].word_wrap = true;
+    app.tabs[0].filter_open = true;
+    app.tabs[0].filter_text = "hit".into();
+    app.apply_search();
+    filter_frame(&ctx, &mut app, vec![]);
+    filter_frame(&ctx, &mut app, vec![]);
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let initial = output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains("hit 00099")
+    ));
+    writer.write_all(b"hit appended").unwrap();
+    app.update_filter(true);
+    filter_frame(&ctx, &mut app, vec![]);
+    filter_frame(&ctx, &mut app, vec![]);
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let appended = output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains("hit appended")
+    ));
+    writer.write_all(b" continued").unwrap();
+    app.update_filter(true);
+    filter_frame(&ctx, &mut app, vec![]);
+    filter_frame(&ctx, &mut app, vec![]);
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let extended = output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains("hit appended continued")
+    ));
+    drop(writer);
+    std::fs::remove_file(path).unwrap();
+    assert!(initial, "tail must show the last result");
+    assert!(appended, "tail must show appended matches");
+    assert!(extended, "tail must remeasure an extended result");
+}
+
+#[test]
+fn preview_wrapped_find_scrollbar_resize_and_scale_preserve_visible_result() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].word_wrap = true;
+    app.tabs[0].filter_open = true;
+    app.tabs[0].text = (0..10000).map(|i| format!("hit {i:05} {}\n", "wide words ".repeat(i % 5 + 5))).collect::<String>().into();
+    app.tabs[0].filter_text = "hit".into();
+    app.apply_search();
+    filter_frame(&ctx, &mut app, vec![]);
+    filter_frame(&ctx, &mut app, vec![]);
+    let start = egui::pos2(795.0, 100.0);
+    let end = egui::pos2(795.0, 450.0);
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+    };
+    filter_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(start), button(start, true)]);
+    filter_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)]);
+    filter_frame(&ctx, &mut app, vec![button(end, false)]);
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    let result = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.contains("hit ") => Some(text.galley.job.text.clone()),
+        _ => None,
+    }).unwrap();
+    let line = result.split_whitespace().next().unwrap().parse::<usize>().unwrap();
+    assert!(line > 1000, "{result}");
+    let run = |app: &mut App| {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 600.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.filter_ui(ui));
+        output.textures_delta.clear();
+        output
+    };
+    run(&mut app);
+    let output = run(&mut app);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text == result
+    )), "resize lost result {line}");
+    ctx.set_pixels_per_point(1.25);
+    app.font_size = 20.0;
+    run(&mut app);
+    let output = run(&mut app);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text == result
+    )), "scale change lost result {line}");
+    let rows = output.shapes.iter().filter_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.contains("hit ") => Some(text),
+        _ => None,
+    }).collect::<Vec<_>>();
+    for pair in rows.windows(2) {
+        assert!(pair[1].pos.y >= pair[0].pos.y + pair[0].galley.size().y - 0.1);
+    }
+}
+
+#[test]
+#[ignore = "manual release-mode profile using test-large-file.txt"]
+fn profile_preview_wrapped_find() {
+    let path = std::env::var_os("RUSTED_PROFILE_FILE")
+        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("test-large-file.txt"));
+    let mut app = test_app();
+    app.open_path(path);
+    assert!(app.message.is_none(), "{:?}", app.message);
+    app.virtual_preview = true;
+    app.tabs[app.active].filter_open = true;
+    app.tabs[app.active].filter_text = "response".into();
+    let start = Instant::now();
+    app.apply_search();
+    eprintln!("search setup: {:?}, {} matching lines", start.elapsed(), app.tabs[app.active].filter.results.len());
+    assert!(!app.tabs[app.active].filter.results.is_empty());
+    let ctx = egui::Context::default();
+    ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    filter_frame(&ctx, &mut app, vec![]);
+    app.tabs[app.active].word_wrap = true;
+    let start = Instant::now();
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    eprintln!("wrapped Find toggle frame: {:?}", start.elapsed());
+    let first_result = |output: &egui::FullOutput| {
+        output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text.to_lowercase().contains("response") => {
+                text.galley.job.text.split_whitespace().next()?.parse::<usize>().ok()
+            }
+            _ => None,
+        }).min()
+    };
+    let before = first_result(&output).expect("no wrapped Find result");
+    let measured = app.tabs[app.active].filter.preview_wrap_cache.as_ref().unwrap().measured_count();
+    assert!(measured < 100, "measured {measured} results in the first frame");
+    let start = Instant::now();
+    filter_frame(&ctx, &mut app, vec![
+        egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::ZERO,
+            phase: egui::TouchPhase::Start, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -1800.0),
+            phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    eprintln!("wrapped Find wheel input: {:?}", start.elapsed());
+    let start = Instant::now();
+    let output = filter_frame(&ctx, &mut app, vec![]);
+    eprintln!("wrapped Find scrolled frame: {:?}", start.elapsed());
+    let after = first_result(&output).expect("no wrapped Find result after scrolling");
+    assert!(after > before, "wheel did not advance results: {before} -> {after}");
+    eprintln!("visible result line: {before} -> {after}");
+}
+
+#[test]
 fn double_click_search_result_preserves_horizontal_scroll() {
     for font_size in [14.0, 30.0] {
         for horizontal in [0.0, 120.0] {

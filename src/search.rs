@@ -1,4 +1,5 @@
 use eframe::egui::{self, Color32, FontId};
+use crate::virtual_filter::PreviewFilterWrapCache;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum HighlightColor {
@@ -208,6 +209,7 @@ pub(crate) struct FilterState {
     pub(crate) selected: Option<usize>,
     pub(crate) needs_rescan: bool,
     pub(crate) wrap_cache: Option<FilterWrapCache>,
+    pub(crate) preview_wrap_cache: Option<PreviewFilterWrapCache>,
 }
 
 pub(crate) struct FilterWrapCache {
@@ -223,6 +225,7 @@ pub(crate) struct FilterWrapCache {
 
 impl FilterState {
     pub(crate) fn scan(&mut self, text: &str, pat: &str, case: bool) {
+        self.preview_wrap_cache = None;
         let keep = self.line;
         let retained = self.results.partition_point(|r| r.0 < keep);
         self.results.truncate(retained);

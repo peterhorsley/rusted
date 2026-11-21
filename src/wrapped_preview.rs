@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::document::DocumentText;
+use crate::sparse_heights::SparseHeights;
 use eframe::egui::{self, Color32, FontId, Key, Modifiers};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -22,58 +22,25 @@ struct WrapKey {
 
 struct WrapIndex {
     key: WrapKey,
-    heights: HashMap<usize, usize>,
-    // Unknown lines contribute one row; the sparse Fenwick tree stores measured extra rows.
-    tree: HashMap<usize, usize>,
+    heights: SparseHeights,
 }
 
 impl WrapIndex {
     fn new(key: WrapKey) -> Self {
-        Self { key, heights: HashMap::new(), tree: HashMap::new() }
+        let heights = SparseHeights::new(key.lines, 1.0);
+        Self { key, heights }
     }
 
     fn set_rows(&mut self, line: usize, rows: usize) {
-        let rows = rows.max(1);
-        let old = self.heights.insert(line, rows).unwrap_or(1);
-        if old == rows {
-            return;
-        }
-        let mut i = line + 1;
-        while i <= self.key.lines {
-            let value = self.tree.entry(i).or_default();
-            *value = *value + rows - old;
-            i += i & i.wrapping_neg();
-        }
+        self.heights.set(line, rows.max(1) as f64);
     }
 
     fn prefix(&self, lines: usize) -> usize {
-        let mut i = lines;
-        let mut rows = lines;
-        while i > 0 {
-            rows += self.tree.get(&i).copied().unwrap_or(0);
-            i &= i - 1;
-        }
-        rows
+        self.heights.prefix(lines) as usize
     }
 
     fn line_at(&self, row: usize) -> usize {
-        let mut bit = 1usize;
-        while bit <= self.key.lines / 2 {
-            bit *= 2;
-        }
-        let (mut index, mut rows) = (0, 0);
-        while bit != 0 {
-            let next = index + bit;
-            if next <= self.key.lines {
-                let candidate = rows + (next & next.wrapping_neg()) + self.tree.get(&next).copied().unwrap_or(0);
-                if candidate <= row {
-                    index = next;
-                    rows = candidate;
-                }
-            }
-            bit /= 2;
-        }
-        index.min(self.key.lines - 1)
+        self.heights.index_at(row as f64).expect("document has at least one line")
     }
 }
 

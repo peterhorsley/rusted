@@ -103,7 +103,7 @@ pub(crate) fn toolbar_button(icon: &egui::TextureHandle, label: &str, selected: 
     egui::Button::image_and_text(image, label.to_owned()).selected(selected)
 }
 
-fn filter_result_label(line: usize, text: &str, terminated: bool, hidden: bool) -> String {
+pub(crate) fn filter_result_label(line: usize, text: &str, terminated: bool, hidden: bool) -> String {
     let text = if hidden {
         let mut shown = text.replace(' ', "·").replace('\t', "───→");
         if terminated {
@@ -267,13 +267,19 @@ impl App {
         if tab.tail && user_interacted(ui, ui.available_rect_before_wrap()) {
             tab.tail = false;
         }
+        if self.virtual_preview && tab.word_wrap {
+            if let Some(line) = crate::virtual_filter::show_wrapped_results(ui, &mut tab.filter, tab.id, tab.tail, &font, tab.hidden_chars) {
+                tab.highlight = Some(line);
+                tab.scroll_to_highlight = true;
+                tab.scroll_to_end = false;
+                tab.tail = false;
+            }
+            return;
+        }
         let mut jump = None;
         let results = &tab.filter.results;
-        let wrap = tab.word_wrap && !self.virtual_preview;
+        let wrap = tab.word_wrap;
         let hidden = tab.hidden_chars;
-        if self.virtual_preview && tab.word_wrap {
-            ui.label("Find results are unwrapped in virtual preview.");
-        }
         let mut selected = tab.filter.selected;
         let mut draw_rows = |ui: &mut egui::Ui, range: std::ops::Range<usize>| {
             ui.style_mut().wrap_mode = Some(if wrap { egui::TextWrapMode::Wrap } else { egui::TextWrapMode::Extend });

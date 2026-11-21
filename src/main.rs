@@ -8,6 +8,8 @@ mod settings;
 mod toolbar;
 mod virtual_preview;
 mod wrapped_preview;
+mod sparse_heights;
+mod virtual_filter;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(test)]
