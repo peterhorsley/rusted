@@ -3,8 +3,12 @@ use eframe::egui::{self, Color32, FontId, Key, Modifiers};
 
 impl App {
     pub(crate) fn virtual_preview_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("Virtual preview: read-only, no wrap, selection, search highlighting or hidden markers.");
+        ui.label("Virtual preview: read-only, no selection, search highlighting or hidden markers.");
         ui.label("Lines longer than 2048 bytes are truncated in this preview.");
+        if self.tabs[self.active].word_wrap {
+            self.wrapped_preview_ui(ui);
+            return;
+        }
 
         let tab = &mut self.tabs[self.active];
         let total = tab.text.line_count();
@@ -17,6 +21,10 @@ impl App {
         let focused = ui.memory(|memory| memory.has_focus(focus_id));
         let mut delta = 0.0;
         let mut target_offset = None;
+        if tab.preview.was_wrapped {
+            target_offset = Some(tab.preview.anchor.min(total - 1) as f32 * row_height);
+        }
+        tab.preview.was_wrapped = false;
         if focused {
             ui.input_mut(|input| {
                 if input.consume_key(Modifiers::NONE, Key::ArrowUp) { delta += row_height; }
@@ -112,5 +120,6 @@ impl App {
             }
         });
         self.status = (total, first_visible + 1, 1);
+        tab.preview.anchor = first_visible;
     }
 }

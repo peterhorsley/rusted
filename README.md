@@ -6,14 +6,19 @@ A minimal, fast, cross-platform GUI text editor written in Rust (egui/eframe).
 
 The normal editor still lays out the entire document with egui's `TextEdit`,
 so large files can block the UI. Program > Enable virtual preview switches to
-an experimental read-only viewport that lays out only visible unwrapped lines.
+an experimental read-only viewport that lays out only visible lines.
+Use Word wrap (or Ctrl+W) to wrap the preview. Wrapped scroll geometry is
+estimated for unvisited lines and refined as they are viewed, so the scrollbar
+and distant drag positions can shift. Resizing or changing the font rebuilds
+that geometry, retaining the current logical line.
 Use the wheel, scrollbar, arrow keys, Page Up/Down, Ctrl+Home/End or Go to line
 to navigate. Find results can be searched and opened, and tailing still reads
 the original file; the preview does not show search highlights, selection,
-hidden characters or wrapped text. It shows only the first 2048 bytes of a
+or hidden characters. It shows only the first 2048 bytes of a
 long line, with an ellipsis, and is not an editor. The existing editor remains
-available via Program > Disable virtual preview. Word wrap and hidden-character
-settings still apply to Find results and to the normal editor.
+available via Program > Disable virtual preview. In the preview, Find results
+remain unwrapped even when the preview is wrapped; the normal editor retains
+its existing Find-result wrapping behavior.
 
 The sparse document line index is rebuilt after text changes, including tail
 appends. Wrapped Find results can still require whole-result layout. Responsive
@@ -23,7 +28,9 @@ To profile the optional local sample, run
 `cargo test --release --locked profile_large_file_editor -- --ignored --nocapture`.
 Use `cargo test --release --locked profile_virtual_preview -- --ignored --nocapture`
 to measure the experimental preview, including its Find results panel.
-The benchmark checks that wheel input changes the visible gutter lines and
+Use `cargo test --release --locked profile_wrapped_virtual_preview -- --ignored --nocapture`
+to measure the wrapped preview.
+The normal-editor benchmark checks that wheel input changes the visible gutter lines and
 reports both the input frame and the subsequent scrolled frame. It measures
 headless egui frames, not GPU rendering or end-to-end UI latency.
 To profile a different sufficiently long file, set `RUSTED_PROFILE_FILE` to

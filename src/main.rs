@@ -7,6 +7,7 @@ mod search;
 mod settings;
 mod toolbar;
 mod virtual_preview;
+mod wrapped_preview;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(test)]

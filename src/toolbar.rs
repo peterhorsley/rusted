@@ -269,8 +269,11 @@ impl App {
         }
         let mut jump = None;
         let results = &tab.filter.results;
-        let wrap = tab.word_wrap;
+        let wrap = tab.word_wrap && !self.virtual_preview;
         let hidden = tab.hidden_chars;
+        if self.virtual_preview && tab.word_wrap {
+            ui.label("Find results are unwrapped in virtual preview.");
+        }
         let mut selected = tab.filter.selected;
         let mut draw_rows = |ui: &mut egui::Ui, range: std::ops::Range<usize>| {
             ui.style_mut().wrap_mode = Some(if wrap { egui::TextWrapMode::Wrap } else { egui::TextWrapMode::Extend });

@@ -3,6 +3,7 @@ use crate::document::DocumentText;
 use crate::search::*;
 use crate::settings::*;
 use crate::toolbar::*;
+use crate::wrapped_preview::VirtualPreviewState;
 use eframe::egui::{self, Color32, FontId, Key, Modifiers};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -55,6 +56,7 @@ pub(crate) struct Tab {
     pub(crate) tail: bool,
     pub(crate) scroll_to_end: bool,
     pub(crate) row_index: RowIndex,
+    pub(crate) preview: VirtualPreviewState,
 }
 
 impl Tab {
@@ -641,6 +643,7 @@ impl App {
             col_sel: None,
             col_drag: false,
             row_index: RowIndex::default(),
+            preview: VirtualPreviewState::default(),
         });
         self.next_id += 1;
         self.active = self.tabs.len() - 1;

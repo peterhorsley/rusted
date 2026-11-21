@@ -560,6 +560,231 @@ fn virtual_preview_goto_and_tail_show_updated_document() {
     std::fs::remove_file(path).unwrap();
 }
 
+fn wrapped_frame(ctx: &egui::Context, app: &mut App, size: egui::Vec2, events: Vec<egui::Event>) -> egui::FullOutput {
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+        events,
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(input, |ui| app.editor_ui(ui));
+    output.textures_delta.clear();
+    output
+}
+
+#[test]
+fn wrapped_virtual_preview_wraps_and_scrolls_without_overlapping_lines() {
+    let ctx = egui::Context::default();
+    ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].word_wrap = true;
+    app.tabs[0].text = (0..1000).map(|i| format!("row {i:05} é\t{}\n", "long word ".repeat(20))).collect::<String>().into();
+    let size = egui::vec2(400.0, 600.0);
+    let output = wrapped_frame(&ctx, &mut app, size, vec![]);
+    let rows = output.shapes.iter().filter_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("row ") => Some(text),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert!(rows.len() > 2 && rows.len() < 30, "visible rows: {}", rows.len());
+    assert!(rows.iter().all(|text| text.galley.rows.len() > 1));
+    for pair in rows.windows(2) {
+        assert!(pair[1].pos.y >= pair[0].pos.y + pair[0].galley.size().y - 0.1);
+    }
+    let first = rows[0].galley.job.text.clone();
+    wrapped_frame(&ctx, &mut app, size, vec![]);
+    wrapped_frame(&ctx, &mut app, size, vec![
+        egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::ZERO,
+            phase: egui::TouchPhase::Start, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -180.0),
+            phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    let output = wrapped_frame(&ctx, &mut app, size, vec![]);
+    assert!(virtual_rows(&output)[0] > first, "first={first:?}, after={:?}, status={:?}", virtual_rows(&output), app.status);
+    app.tabs[0].scroll_to_goto = Some(900);
+    wrapped_frame(&ctx, &mut app, size, vec![]);
+    let output = wrapped_frame(&ctx, &mut app, size, vec![]);
+    assert!(virtual_rows(&output).iter().any(|text| text.starts_with("row 00900")), "{:?}", virtual_rows(&output));
+    let before_resize = app.status.1;
+    let output = wrapped_frame(&ctx, &mut app, egui::vec2(300.0, 600.0), vec![]);
+    assert!(virtual_rows(&output).iter().any(|text| text.starts_with(&format!("row {:05}", before_resize - 1))));
+    app.font_size = 20.0;
+    let output = wrapped_frame(&ctx, &mut app, egui::vec2(300.0, 600.0), vec![]);
+    assert!(virtual_rows(&output).iter().any(|text| text.starts_with(&format!("row {:05}", before_resize - 1))));
+    wrapped_frame(&ctx, &mut app, size, vec![key_event(Key::End, Modifiers::COMMAND)]);
+    let output = wrapped_frame(&ctx, &mut app, size, vec![]);
+    assert!(virtual_rows(&output).iter().any(|text| text.starts_with("row 00999")), "{:?}", virtual_rows(&output));
+}
+
+#[test]
+fn wrapped_virtual_preview_invalidates_geometry_on_same_length_edit() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].word_wrap = true;
+    app.tabs[0].text = format!("row first {}\nrow second", "a".repeat(30)).into();
+    let size = egui::vec2(300.0, 400.0);
+    let output = wrapped_frame(&ctx, &mut app, size, vec![]);
+    let first_height = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("row first") => Some(text.galley.size().y),
+        _ => None,
+    }).unwrap();
+    app.tabs[0].text = format!("row first {}\nrow second", "\t".repeat(30)).into();
+    let output = wrapped_frame(&ctx, &mut app, size, vec![]);
+    let first_height_after = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("row first") => Some(text.galley.size().y),
+        _ => None,
+    }).unwrap();
+    assert_ne!(first_height, first_height_after);
+    let rows = output.shapes.iter().filter_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.starts_with("row ") => Some(text),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert!(rows[1].pos.y >= rows[0].pos.y + rows[0].galley.size().y - 0.1);
+}
+
+#[test]
+fn wrapped_virtual_preview_preserves_line_geometry_at_different_scales() {
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(scale);
+        let mut app = test_app();
+        app.virtual_preview = true;
+        app.tabs[0].word_wrap = true;
+        app.font_size = 17.0;
+        app.tabs[0].text = (0..20).map(|i| format!("row {i:05} é\t{}\n", "some words ".repeat(10))).collect::<String>().into();
+        let output = wrapped_frame(&ctx, &mut app, egui::vec2(400.0, 600.0), vec![]);
+        let rows = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text.starts_with("row ") => Some(text),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert!(rows.len() > 2);
+        for pair in rows.windows(2) {
+            assert!((pair[1].pos.y - pair[0].pos.y - pair[0].galley.size().y).abs() < 0.1,
+                "scale={scale}, delta={}, height={}, rows={}", pair[1].pos.y - pair[0].pos.y, pair[0].galley.size().y, pair[0].galley.rows.len());
+        }
+    }
+}
+
+#[test]
+fn wrapped_virtual_preview_scrollbar_and_mode_switch() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs[0].word_wrap = true;
+    app.tabs[0].text = (0..10000).map(|i| format!("row {i:05} {}\n", "wide words ".repeat(15))).collect::<String>().into();
+    let size = egui::vec2(400.0, 600.0);
+    wrapped_frame(&ctx, &mut app, size, vec![]);
+    wrapped_frame(&ctx, &mut app, size, vec![]);
+    let start = egui::pos2(395.0, 80.0);
+    let end = egui::pos2(395.0, 450.0);
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+    };
+    wrapped_frame(&ctx, &mut app, size, vec![egui::Event::PointerMoved(start), button(start, true)]);
+    wrapped_frame(&ctx, &mut app, size, vec![egui::Event::PointerMoved(end)]);
+    wrapped_frame(&ctx, &mut app, size, vec![button(end, false)]);
+    let output = wrapped_frame(&ctx, &mut app, size, vec![]);
+    assert!(app.status.1 > 1000, "{:?}", virtual_rows(&output));
+    let line = app.status.1;
+    app.tabs[0].word_wrap = false;
+    let output = wrapped_frame(&ctx, &mut app, size, vec![]);
+    assert!(virtual_rows(&output).iter().any(|text| text.starts_with(&format!("row {:05}", line - 1))));
+    app.tabs[0].word_wrap = true;
+    let output = wrapped_frame(&ctx, &mut app, size, vec![]);
+    assert!(virtual_rows(&output).iter().any(|text| text.starts_with(&format!("row {:05}", line - 1))));
+    wrapped_frame(&ctx, &mut app, size, vec![key_event(Key::PageDown, Modifiers::NONE)]);
+    wrapped_frame(&ctx, &mut app, size, vec![]);
+    assert!(app.status.1 > line);
+}
+
+#[test]
+fn wrapped_virtual_preview_follows_tail_after_append() {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!(
+        "rusted-wrapped-tail-{}-{}.txt", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let text = (0..200).map(|i| format!("row {i:05} {}\n", "long word ".repeat(20))).collect::<String>();
+    std::fs::write(&path, text).unwrap();
+    let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    app.virtual_preview = true;
+    app.tabs.clear();
+    app.open_startup_file(path.clone(), true);
+    app.tabs[0].word_wrap = true;
+    goto_frame(&ctx, &mut app, vec![]);
+    writer.write_all(b"row 00200 appended\n").unwrap();
+    app.update_filter(true);
+    goto_frame(&ctx, &mut app, vec![]);
+    let output = goto_frame(&ctx, &mut app, vec![]);
+    let found = virtual_rows(&output).iter().any(|text| text.starts_with("row 00200 appended"));
+    drop(writer);
+    std::fs::remove_file(path).unwrap();
+    assert!(found, "new tail line should be visible");
+}
+
+#[test]
+#[ignore = "manual release-mode profile using test-large-file.txt"]
+fn profile_wrapped_virtual_preview() {
+    let path = std::env::var_os("RUSTED_PROFILE_FILE")
+        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("test-large-file.txt"));
+    let mut app = test_app();
+    app.open_path(path);
+    assert!(app.message.is_none(), "{:?}", app.message);
+    app.virtual_preview = true;
+    let ctx = egui::Context::default();
+    ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    goto_frame(&ctx, &mut app, vec![]);
+    app.tabs[app.active].filter_open = true;
+    app.tabs[app.active].filter_text = "response".into();
+    app.apply_search();
+    goto_frame(&ctx, &mut app, vec![]);
+    app.tabs[app.active].word_wrap = true;
+    let start = Instant::now();
+    goto_frame(&ctx, &mut app, vec![]);
+    eprintln!("wrap toggle frame: {:?}", start.elapsed());
+    let start = Instant::now();
+    goto_frame(&ctx, &mut app, vec![]);
+    eprintln!("wrapped redraw: {:?}", start.elapsed());
+    let target = app.tabs[app.active].text.line_count() * 9 / 10;
+    let (text, truncated) = app.tabs[app.active].text.preview_lines_from(target).unwrap().next().unwrap();
+    let target_text = if truncated { format!("{text}…") } else { text.to_owned() };
+    app.tabs[app.active].scroll_to_goto = Some(target);
+    let start = Instant::now();
+    let output = goto_frame(&ctx, &mut app, vec![]);
+    eprintln!("wrapped deep jump: {:?}", start.elapsed());
+    assert_eq!(app.status.1, target + 1);
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(text) if text.galley.job.text == target_text
+    )), "deep target text was not rendered");
+    let start = Instant::now();
+    goto_frame(&ctx, &mut app, vec![
+        egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::ZERO,
+            phase: egui::TouchPhase::Start, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -180.0),
+            phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    eprintln!("wrapped wheel input: {:?}", start.elapsed());
+    let start = Instant::now();
+    goto_frame(&ctx, &mut app, vec![]);
+    eprintln!("wrapped scrolled frame: {:?}", start.elapsed());
+}
+
 #[test]
 #[ignore = "manual release-mode profile using test-large-file.txt"]
 fn profile_virtual_preview() {
